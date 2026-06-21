@@ -1,19 +1,22 @@
+import logging
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import delete as sa_delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.core import events
 from backend.core.config import get_setting
 from backend.core.deps import get_current_user, require_admin
 from backend.core.rclone_runner import speed_test
-from backend.core.ssh_client import shutdown_node, test_ssh_connection
+from backend.core.ssh_client import sftp_list_dir, shutdown_node, test_ssh_connection
 from backend.core.ssh_key_store import delete_key, save_key
 from backend.core.wol import send_wol
 from backend.db.session import get_db
-from backend.models import Node, User
+from backend.models import Node, NodeFileCache, User
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/nodes", tags=["nodes"])
 
@@ -30,8 +33,12 @@ def _node_dict(n: Node) -> dict:
         "ssh_port": n.ssh_port,
         "sftp_root": n.sftp_root,
         "allow_shutdown": n.allow_shutdown,
+        "wol_timeout": n.wol_timeout,
+        "idle_shutdown_enabled": n.idle_shutdown_enabled,
+        "idle_shutdown_timeout": n.idle_shutdown_timeout,
         "status": n.status,
         "last_seen": n.last_seen.isoformat() + "Z" if n.last_seen else None,
+        "last_active_at": n.last_active_at.isoformat() + "Z" if n.last_active_at else None,
         "last_cache_refresh": n.last_cache_refresh.isoformat() + "Z" if n.last_cache_refresh else None,
     }
 
@@ -46,6 +53,9 @@ class NodeCreate(BaseModel):
     ssh_port: int = 22
     sftp_root: str = "/"
     allow_shutdown: bool = True
+    wol_timeout: int = 300
+    idle_shutdown_enabled: bool = False
+    idle_shutdown_timeout: int = 3600
 
 
 class NodeUpdate(BaseModel):
@@ -58,6 +68,9 @@ class NodeUpdate(BaseModel):
     ssh_port: Optional[int] = None
     sftp_root: Optional[str] = None
     allow_shutdown: Optional[bool] = None
+    wol_timeout: Optional[int] = None
+    idle_shutdown_enabled: Optional[bool] = None
+    idle_shutdown_timeout: Optional[int] = None
 
 
 @router.get("")
@@ -218,3 +231,84 @@ async def wake_node(
         raise HTTPException(404, "Node not found")
     broadcast = await get_setting(db, "wol_broadcast") or "255.255.255.255"
     await send_wol(node.mac, broadcast)
+
+
+# ─── SFTP browse ──────────────────────────────────────────────────────────────
+
+def _parent_prefix(path: str) -> str:
+    """Prefix for direct-child path queries. Root stays '/', others get '/'."""
+    return "/" if path == "/" else path.rstrip("/") + "/"
+
+
+async def _cached_children(db: AsyncSession, node_id: int, path: str) -> list[dict]:
+    prefix = _parent_prefix(path)
+    result = await db.execute(
+        select(NodeFileCache)
+        .where(
+            NodeFileCache.node_id == node_id,
+            NodeFileCache.path.like(f"{prefix}%"),
+            ~NodeFileCache.path.like(f"{prefix}%/%"),
+        )
+        .order_by(NodeFileCache.type.desc(), NodeFileCache.name)
+    )
+    return [
+        {
+            "name": e.name,
+            "path": e.path,
+            "type": e.type,
+            "size_bytes": e.size_bytes,
+            "modified_at": e.modified_at.isoformat() + "Z" if e.modified_at else None,
+        }
+        for e in result.scalars()
+    ]
+
+
+async def _update_path_cache(db: AsyncSession, node_id: int, path: str, entries: list[dict]) -> None:
+    prefix = _parent_prefix(path)
+    await db.execute(
+        sa_delete(NodeFileCache).where(
+            NodeFileCache.node_id == node_id,
+            NodeFileCache.path.like(f"{prefix}%"),
+            ~NodeFileCache.path.like(f"{prefix}%/%"),
+        )
+    )
+    for e in entries:
+        db.add(NodeFileCache(
+            node_id=node_id,
+            path=e["path"],
+            name=e["name"],
+            type=e["type"],
+            size_bytes=e.get("size_bytes"),
+            modified_at=None,
+        ))
+    await db.commit()
+
+
+@router.get("/{node_id}/browse")
+async def browse_node_path(
+    node_id: int,
+    path: str = "/",
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(get_current_user),
+):
+    """List immediate children of *path* on the node via live SFTP (online)
+    or from the local cache (offline / unreachable)."""
+    node = await db.get(Node, node_id)
+    if not node:
+        raise HTTPException(404, "Node not found")
+
+    if node.status == "online":
+        try:
+            entries = await sftp_list_dir(
+                node.ip, node.ssh_user, node.ssh_key_path, node.ssh_port, path
+            )
+            try:
+                await _update_path_cache(db, node_id, path, entries)
+            except Exception as exc:
+                logger.warning("Cache update failed node=%s path=%s: %s", node_id, path, exc)
+            return entries
+        except Exception as exc:
+            logger.warning("SFTP browse failed node=%s path=%s: %s", node_id, path, exc)
+
+    # Offline fallback — return whatever is cached for this directory
+    return await _cached_children(db, node_id, path)

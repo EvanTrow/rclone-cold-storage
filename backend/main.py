@@ -22,6 +22,9 @@ from backend.core.node_status import refresh_node_statuses
 from backend.core.scheduler import get_scheduler, start_scheduler, stop_scheduler
 from backend.db.session import init_db
 
+import logging
+logger = logging.getLogger(__name__)
+
 ROLE = os.getenv("ROLE", "controller")
 
 
@@ -38,24 +41,57 @@ async def lifespan(app: FastAPI):
             id="node_status_refresh",
             replace_existing=True,
         )
+        get_scheduler().add_job(
+            _check_idle_nodes,
+            "interval",
+            seconds=60,
+            id="idle_node_check",
+            replace_existing=True,
+        )
         asyncio.create_task(refresh_node_statuses())
-    elif ROLE == "node":
-        await _start_node_agent()
     yield
     stop_scheduler()
 
 
-async def _start_node_agent() -> None:
-    from backend.agent.idle_monitor import monitor_idle
-    from backend.core.config import get_setting
+async def _check_idle_nodes() -> None:
+    from datetime import datetime
+    from sqlalchemy import select
+
+    from backend.core import events
+    from backend.core.ssh_client import shutdown_node
     from backend.db.session import AsyncSessionLocal
+    from backend.models import Node, NodeLock
 
     async with AsyncSessionLocal() as db:
-        enabled = (await get_setting(db, "idle_shutdown_enabled") or "false").lower() == "true"
-        timeout = int(await get_setting(db, "idle_shutdown_timeout") or 3600)
+        result = await db.execute(
+            select(Node).where(
+                Node.idle_shutdown_enabled == True,  # noqa: E712
+                Node.status == "online",
+                Node.last_active_at.isnot(None),
+            )
+        )
+        nodes = list(result.scalars())
 
-    if enabled:
-        asyncio.create_task(monitor_idle(timeout))
+        locked_result = await db.execute(select(NodeLock.node_id))
+        locked_ids = {row[0] for row in locked_result}
+
+        now = datetime.utcnow()
+        for node in nodes:
+            if node.id in locked_ids:
+                continue
+            if not node.allow_shutdown:
+                continue
+            idle_secs = (now - node.last_active_at).total_seconds()
+            if idle_secs < node.idle_shutdown_timeout:
+                continue
+            logger.info("Shutting down idle node %s (idle %.0fs / timeout %ds)", node.name, idle_secs, node.idle_shutdown_timeout)
+            try:
+                await shutdown_node(node.ip, node.ssh_user, node.ssh_key_path, node.ssh_port)
+                node.status = "offline"
+                await db.commit()
+                events.publish_nodes()
+            except Exception as exc:
+                logger.warning("Failed to shut down idle node %s: %s", node.name, exc)
 
 
 async def _load_scheduled_jobs() -> None:

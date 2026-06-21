@@ -147,7 +147,6 @@ async def _run_job(
             events.publish_runs()
 
     wol_broadcast = await get_setting(db, "wol_broadcast") or "255.255.255.255"
-    wol_max_retries = int(await get_setting(db, "wol_max_retries") or 30)
 
     for node_id in node_ids:
         node = await db.get(Node, node_id)
@@ -163,10 +162,11 @@ async def _run_job(
             await flush_log()
             events.publish_nodes()
             await wol.send_wol(node.mac, wol_broadcast)
-            log(f"Waiting for {node.name} to come online…")
+            timeout_mins = (node.wol_timeout or 300) // 60
+            log(f"Waiting up to {timeout_mins}m for {node.name} to come online…")
             reachable = await ssh_client.poll_until_reachable(
                 node.ip, node.ssh_user, node.ssh_key_path, node.ssh_port,
-                max_retries=wol_max_retries,
+                timeout_secs=node.wol_timeout or 300,
             )
             if not reachable:
                 raise RuntimeError(f"{node.name} did not wake within timeout")
@@ -176,6 +176,7 @@ async def _run_job(
 
         node.status = "online"
         node.last_seen = datetime.utcnow()
+        node.last_active_at = datetime.utcnow()
         await flush_log()
         events.publish_nodes()
 

@@ -1,122 +1,83 @@
-import RefreshIcon from '@mui/icons-material/Refresh';
-import { Box, Button, Checkbox, CircularProgress, IconButton, Paper, Tooltip, Typography } from '@mui/material';
-import { SimpleTreeView } from '@mui/x-tree-view/SimpleTreeView';
-import { TreeItem } from '@mui/x-tree-view/TreeItem';
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { useMemo, useState } from 'react';
-import { type CacheEntry, nodesApi } from '../lib/api';
-import { Folder, Home, InsertDriveFile } from '@mui/icons-material';
+import ChevronRight from '@mui/icons-material/ChevronRight';
+import ExpandMore from '@mui/icons-material/ExpandMore';
+import Folder from '@mui/icons-material/Folder';
+import Home from '@mui/icons-material/Home';
+import InsertDriveFile from '@mui/icons-material/InsertDriveFile';
+import { Box, Checkbox, CircularProgress, Paper, Skeleton, Typography } from '@mui/material';
+import { useVirtualizer } from '@tanstack/react-virtual';
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { nodesApi, type SftpEntry } from '../lib/api';
 
-// ─── Tree data model ──────────────────────────────────────────────────────────
+// All rows share the same pixel height — required for fixed-size virtualizer math.
+const ITEM_HEIGHT = 28;
+// Visible area of the scroll container in pixels.
+const CONTAINER_HEIGHT = 272;
 
-interface TreeNode {
-	name: string;
+// ─── Pure selection helpers ────────────────────────────────────────────────────
+
+interface MapNode {
 	path: string;
 	type: 'file' | 'dir';
-	size_bytes: number | null;
-	children: TreeNode[];
+	children: SftpEntry[];
 }
-
-function buildTree(entries: CacheEntry[]): TreeNode[] {
-	const map = new Map<string, TreeNode>();
-	for (const e of entries) {
-		map.set(e.path, { name: e.name, path: e.path, type: e.type, size_bytes: e.size_bytes, children: [] });
-	}
-	const roots: TreeNode[] = [];
-	for (const e of entries) {
-		const node = map.get(e.path)!;
-		const lastSlash = e.path.lastIndexOf('/');
-		const parentPath = lastSlash > 0 ? e.path.slice(0, lastSlash) : '';
-		if (parentPath && map.has(parentPath)) {
-			map.get(parentPath)!.children.push(node);
-		} else {
-			roots.push(node);
-		}
-	}
-	const sort = (nodes: TreeNode[]) => {
-		nodes.sort((a, b) => {
-			if (a.type !== b.type) return a.type === 'dir' ? -1 : 1;
-			return a.name.localeCompare(b.name);
-		});
-		for (const n of nodes) sort(n.children);
-	};
-	sort(roots);
-	return roots;
-}
-
-function buildNodeMap(nodes: TreeNode[]): Map<string, TreeNode> {
-	const map = new Map<string, TreeNode>();
-	const walk = (list: TreeNode[]) => {
-		for (const n of list) {
-			map.set(n.path, n);
-			if (n.type === 'dir') walk(n.children);
-		}
-	};
-	walk(nodes);
-	return map;
-}
-
-function collectDescendants(node: TreeNode): string[] {
-	const ids: string[] = [];
-	const walk = (n: TreeNode) => {
-		for (const child of n.children) {
-			ids.push(child.path);
-			if (child.type === 'dir') walk(child);
-		}
-	};
-	walk(node);
-	return ids;
-}
-
-// ─── Selection helpers ────────────────────────────────────────────────────────
 
 function isDescendantOf(id: string, ancestor: string): boolean {
 	const prefix = ancestor === '/' ? '/' : ancestor + '/';
 	return id !== ancestor && id.startsWith(prefix);
 }
 
-/**
- * Add all (visible) children of `node` to `result`, except for paths in
- * `missing` or branches containing a missing descendant (which are recursed
- * into to preserve their siblings).
- */
-function explodeExcept(node: TreeNode, missing: Set<string>, result: Set<string>, nodeMap: Map<string, TreeNode>, itemFilter: (n: TreeNode) => boolean): void {
+function collectDescendants(node: MapNode, map: Map<string, MapNode>): string[] {
+	const ids: string[] = [];
+	function walk(n: MapNode) {
+		for (const c of n.children) {
+			ids.push(c.path);
+			const cn = map.get(c.path);
+			if (cn?.type === 'dir') walk(cn);
+		}
+	}
+	walk(node);
+	return ids;
+}
+
+function explodeExcept(
+	node: MapNode,
+	missing: Set<string>,
+	result: Set<string>,
+	map: Map<string, MapNode>,
+	filter: (e: SftpEntry) => boolean,
+): void {
 	for (const child of node.children) {
-		if (!itemFilter(child)) continue;
-		if (missing.has(child.path)) {
-			// This is the removed item — skip it
-		} else if ([...missing].some((m) => isDescendantOf(m, child.path))) {
-			// A descendant was removed — preserve its siblings by recursing
-			explodeExcept(child, missing, result, nodeMap, itemFilter);
+		if (!filter(child)) continue;
+		if (missing.has(child.path)) continue;
+		if ([...missing].some(m => isDescendantOf(m, child.path))) {
+			const cn = map.get(child.path);
+			if (cn) explodeExcept(cn, missing, result, map, filter);
 		} else {
 			result.add(child.path);
 		}
 	}
 }
 
-/**
- * If all visible children of a folder are individually in `canonicalIds`,
- * replace them with just the parent. Repeats until stable.
- */
-function promote(canonicalIds: Set<string>, nodeMap: Map<string, TreeNode>, itemFilter: (n: TreeNode) => boolean): void {
+function promote(
+	canonical: Set<string>,
+	map: Map<string, MapNode>,
+	filter: (e: SftpEntry) => boolean,
+): void {
 	let changed = true;
 	while (changed) {
 		changed = false;
-		for (const [path, node] of nodeMap) {
-			if (node.type !== 'dir' || canonicalIds.has(path)) continue;
-			const visible = node.children.filter(itemFilter);
-			if (visible.length === 0) continue;
-			if (visible.every((c) => canonicalIds.has(c.path))) {
-				canonicalIds.add(path);
-				visible.forEach((c) => canonicalIds.delete(c.path));
+		for (const [path, node] of map) {
+			if (node.type !== 'dir' || canonical.has(path)) continue;
+			const visible = node.children.filter(filter);
+			if (visible.length > 0 && visible.every(c => canonical.has(c.path))) {
+				canonical.add(path);
+				visible.forEach(c => canonical.delete(c.path));
 				changed = true;
 				break;
 			}
 		}
 	}
 }
-
-// ─── Rendering helpers ────────────────────────────────────────────────────────
 
 function fmtBytes(n: number): string {
 	if (n < 1024) return `${n} B`;
@@ -125,80 +86,163 @@ function fmtBytes(n: number): string {
 	return `${(n / 1024 ** 3).toFixed(1)} GB`;
 }
 
-/** Tree item for single-select destination browser (no checkbox). */
-function renderTree(nodes: TreeNode[], dirsOnly: boolean): React.ReactNode {
-	return nodes
-		.filter((n) => !dirsOnly || n.type === 'dir')
-		.map((n) => (
-			<TreeItem
-				key={n.path}
-				itemId={n.path}
-				label={
-					<Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75, py: 0.25 }}>
-						<span style={{ fontSize: 14 }}>{n.type === 'dir' ? '📁' : '📄'}</span>
-						<Typography variant='body2' noWrap sx={{ flexGrow: 1, minWidth: 0 }}>
-							{n.name}
-						</Typography>
-						{n.type === 'file' && n.size_bytes !== null && (
-							<Typography variant='caption' color='text.secondary' sx={{ flexShrink: 0, ml: 1 }}>
-								{fmtBytes(n.size_bytes)}
-							</Typography>
-						)}
-					</Box>
-				}
-			>
-				{n.type === 'dir' ? renderTree(n.children, dirsOnly) : null}
-			</TreeItem>
-		));
+// ─── Flat list types and builder ──────────────────────────────────────────────
+
+type FlatItem =
+	| { kind: 'entry'; entry: SftpEntry; depth: number; isExpanded: boolean }
+	| { kind: 'skel'; key: string; depth: number; idx: number }
+	| { kind: 'error'; key: string; depth: number; msg: string }
+	| { kind: 'empty'; key: string; depth: number };
+
+interface DirState {
+	loading: boolean;
+	entries: SftpEntry[];
+	error: string | null;
 }
 
-/** Tree item for multi-select source browser (custom checkbox with indeterminate). */
-function MultiSelectItem({
-	node,
-	dirsOnly,
-	checkedSet,
-	indeterminateSet,
-	onToggle,
-}: {
-	node: TreeNode;
-	dirsOnly: boolean;
-	checkedSet: Set<string>;
-	indeterminateSet: Set<string>;
-	onToggle: (id: string, checked: boolean) => void;
-}) {
-	if (dirsOnly && node.type === 'file') return null;
-	return (
-		<TreeItem
-			itemId={node.path}
-			label={
-				<Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75, py: 0.25 }}>
-					<Checkbox
-						size='small'
-						checked={checkedSet.has(node.path)}
-						indeterminate={indeterminateSet.has(node.path)}
-						onChange={(e) => onToggle(node.path, e.target.checked)}
-						onClick={(e) => e.stopPropagation()}
-						sx={{ p: 0.25, ml: -0.5 }}
-						tabIndex={-1}
-					/>
-					{node.type === 'dir' ? <Folder sx={{ fontSize: 18, color: 'primary.main' }} /> : <InsertDriveFile sx={{ fontSize: 18, color: 'text.secondary' }} />}
-					<Typography variant='body2' noWrap sx={{ flexGrow: 1, minWidth: 0 }}>
-						{node.name}
-					</Typography>
-					{node.type === 'file' && node.size_bytes !== null && (
-						<Typography variant='caption' color='text.secondary' sx={{ flexShrink: 0, ml: 1 }}>
-							{fmtBytes(node.size_bytes)}
-						</Typography>
-					)}
-				</Box>
-			}
-		>
-			{node.type === 'dir'
-				? node.children.map((child) => <MultiSelectItem key={child.path} node={child} dirsOnly={dirsOnly} checkedSet={checkedSet} indeterminateSet={indeterminateSet} onToggle={onToggle} />)
-				: null}
-		</TreeItem>
-	);
+function buildFlatList(
+	dirPath: string,
+	dirs: Map<string, DirState>,
+	expandedPaths: Set<string>,
+	depth: number,
+	dirsOnly: boolean,
+): FlatItem[] {
+	const state = dirs.get(dirPath);
+	if (!state || state.loading) {
+		return ([0, 1, 2] as const).map(idx => ({
+			kind: 'skel' as const,
+			key: `${dirPath}/__sk${idx}`,
+			depth,
+			idx,
+		}));
+	}
+	if (state.error) {
+		return [{ kind: 'error', key: `${dirPath}/__err`, depth, msg: state.error }];
+	}
+	const all = dirsOnly ? state.entries.filter(e => e.type === 'dir') : state.entries;
+	if (all.length === 0) {
+		return [{ kind: 'empty', key: `${dirPath}/__empty`, depth }];
+	}
+	const result: FlatItem[] = [];
+	for (const entry of all) {
+		const isDir = entry.type === 'dir';
+		const isExpanded = isDir && expandedPaths.has(entry.path);
+		result.push({ kind: 'entry', entry, depth, isExpanded });
+		if (isExpanded) {
+			result.push(...buildFlatList(entry.path, dirs, expandedPaths, depth + 1, dirsOnly));
+		}
+	}
+	return result;
 }
+
+function flatKey(item: FlatItem): string {
+	return item.kind === 'entry' ? item.entry.path : item.key;
+}
+
+// ─── Memoized entry row ───────────────────────────────────────────────────────
+
+interface EntryRowProps {
+	entry: SftpEntry;
+	depth: number;
+	isExpanded: boolean;
+	checked: boolean;
+	indeterminate: boolean;
+	isSelected: boolean;
+	multiSelect: boolean;
+	onChevron: (path: string) => void;
+	onCheck: (path: string, checked: boolean) => void;
+	onRowClick: (entry: SftpEntry) => void;
+}
+
+const EntryRow = memo(function EntryRow({
+	entry,
+	depth,
+	isExpanded,
+	checked,
+	indeterminate,
+	isSelected,
+	multiSelect,
+	onChevron,
+	onCheck,
+	onRowClick,
+}: EntryRowProps) {
+	const isDir = entry.type === 'dir';
+	return (
+		<Box
+			onClick={() => onRowClick(entry)}
+			sx={{
+				display: 'flex',
+				alignItems: 'center',
+				height: ITEM_HEIGHT,
+				pl: `${depth * 16 + 4}px`,
+				pr: 1,
+				gap: 0.5,
+				cursor: 'pointer',
+				userSelect: 'none',
+				bgcolor: !multiSelect && isSelected ? 'action.selected' : 'transparent',
+				'&:hover': {
+					bgcolor: !multiSelect && isSelected ? 'action.selected' : 'action.hover',
+				},
+			}}
+		>
+			{/* Expand chevron */}
+			<Box
+				onClick={
+					isDir
+						? e => {
+								e.stopPropagation();
+								onChevron(entry.path);
+							}
+						: undefined
+				}
+				sx={{
+					width: 18,
+					flexShrink: 0,
+					display: 'flex',
+					alignItems: 'center',
+					justifyContent: 'center',
+					color: 'text.secondary',
+					borderRadius: 0.5,
+					'&:hover': isDir ? { bgcolor: 'action.focus' } : {},
+				}}
+			>
+				{isDir && (isExpanded ? <ExpandMore sx={{ fontSize: 14 }} /> : <ChevronRight sx={{ fontSize: 14 }} />)}
+			</Box>
+
+			{/* Checkbox (multi-select only) */}
+			{multiSelect && (
+				<Checkbox
+					size='small'
+					checked={checked}
+					indeterminate={isDir && indeterminate}
+					onChange={e => onCheck(entry.path, e.target.checked)}
+					onClick={e => e.stopPropagation()}
+					sx={{ p: 0.25, flexShrink: 0 }}
+					tabIndex={-1}
+				/>
+			)}
+
+			{/* Type icon */}
+			{isDir ? (
+				<Folder sx={{ fontSize: 16, color: 'primary.main', flexShrink: 0 }} />
+			) : (
+				<InsertDriveFile sx={{ fontSize: 16, color: 'text.secondary', flexShrink: 0 }} />
+			)}
+
+			{/* Name */}
+			<Typography variant='body2' noWrap sx={{ flexGrow: 1, minWidth: 0 }}>
+				{entry.name}
+			</Typography>
+
+			{/* File size */}
+			{!isDir && entry.size_bytes !== null && (
+				<Typography variant='caption' color='text.secondary' sx={{ flexShrink: 0 }}>
+					{fmtBytes(entry.size_bytes)}
+				</Typography>
+			)}
+		</Box>
+	);
+});
 
 // ─── Component ────────────────────────────────────────────────────────────────
 
@@ -211,135 +255,191 @@ interface FileBrowserProps {
 	dirsOnly?: boolean;
 }
 
-export function FileBrowser({ nodeId, sftpRoot = '/', selected, onChange, multiSelect = true, dirsOnly = false }: FileBrowserProps) {
-	const qc = useQueryClient();
-	const [waiting, setWaiting] = useState(false);
-
-	const {
-		data: entries,
-		isLoading,
-		isFetching,
-	} = useQuery({
-		queryKey: ['nodeFiles', nodeId],
-		queryFn: () => nodesApi.getFiles(nodeId!),
-		enabled: nodeId !== undefined,
-		staleTime: 60_000,
-	});
-
-	const refreshMut = useMutation({
-		mutationFn: () => nodesApi.refreshFiles(nodeId!),
-		onSuccess: () => {
-			setWaiting(true);
-			setTimeout(() => {
-				setWaiting(false);
-				qc.invalidateQueries({ queryKey: ['nodeFiles', nodeId] });
-			}, 5000);
-		},
-	});
-
+export function FileBrowser({
+	nodeId,
+	sftpRoot = '/',
+	selected,
+	onChange,
+	multiSelect = true,
+	dirsOnly = false,
+}: FileBrowserProps) {
 	const rootPath = sftpRoot.replace(/\/$/, '') || '/';
-	const toItemId = (path: string): string => path.replace(/\/$/, '') || rootPath;
-	const itemFilter = (n: TreeNode) => !dirsOnly || n.type === 'dir';
+	const toItemId = (path: string) => path.replace(/\/$/, '') || rootPath;
 
-	const tree = useMemo(() => (entries ? buildTree(entries) : []), [entries]);
+	const [dirs, setDirs] = useState<Map<string, DirState>>(new Map());
+	const [expandedPaths, setExpandedPaths] = useState<Set<string>>(new Set([rootPath]));
 
-	const nodeMap = useMemo(() => {
-		const map = buildNodeMap(tree);
-		map.set(rootPath, { name: rootPath, path: rootPath, type: 'dir', size_bytes: null, children: tree });
+	const containerRef = useRef<HTMLDivElement>(null);
+	const inFlight = useRef(new Set<string>());
+
+	// ── loading ──────────────────────────────────────────────────────────────────
+	const loadDir = useCallback(
+		async (dirPath: string) => {
+			if (nodeId === undefined || inFlight.current.has(dirPath)) return;
+			inFlight.current.add(dirPath);
+			setDirs(prev => new Map(prev).set(dirPath, { loading: true, entries: [], error: null }));
+			try {
+				const entries = await nodesApi.browseFiles(nodeId, dirPath);
+				setDirs(prev => new Map(prev).set(dirPath, { loading: false, entries, error: null }));
+			} catch (e) {
+				setDirs(prev =>
+					new Map(prev).set(dirPath, {
+						loading: false,
+						entries: [],
+						error: e instanceof Error ? e.message : 'Failed to load',
+					}),
+				);
+			} finally {
+				inFlight.current.delete(dirPath);
+			}
+		},
+		[nodeId],
+	);
+
+	useEffect(() => {
+		setDirs(new Map());
+		setExpandedPaths(new Set([rootPath]));
+		inFlight.current.clear();
+		if (nodeId !== undefined) loadDir(rootPath);
+		// eslint-disable-next-line react-hooks/exhaustive-deps
+	}, [nodeId, rootPath]);
+
+	// ── nodeMap: flat index of all loaded paths for selection math ─────────────
+	const nodeMap = useMemo((): Map<string, MapNode> => {
+		const map = new Map<string, MapNode>();
+		map.set(rootPath, {
+			path: rootPath,
+			type: 'dir',
+			children: dirs.get(rootPath)?.entries ?? [],
+		});
+		for (const [, state] of dirs) {
+			for (const entry of state.entries) {
+				map.set(entry.path, {
+					path: entry.path,
+					type: entry.type,
+					children: entry.type === 'dir' ? (dirs.get(entry.path)?.entries ?? []) : [],
+				});
+			}
+		}
 		return map;
-	}, [tree, rootPath]);
+	}, [dirs, rootPath]);
 
-	/**
-	 * Expanded visual selection: every item that should appear checked.
-	 * Includes the canonical item itself plus all its visible descendants.
-	 */
-	const expandedItems = useMemo(() => {
+	const itemFilter = useCallback((e: SftpEntry) => !dirsOnly || e.type === 'dir', [dirsOnly]);
+
+	const checkedSet = useMemo(() => {
 		const result = new Set<string>();
 		for (const path of selected) {
 			const id = toItemId(path);
 			const n = nodeMap.get(id);
 			if (!dirsOnly || n?.type !== 'file') result.add(id);
 			if (n?.type === 'dir') {
-				for (const d of collectDescendants(n)) {
+				for (const d of collectDescendants(n, nodeMap)) {
 					const dn = nodeMap.get(d);
 					if (!dirsOnly || dn?.type === 'dir') result.add(d);
 				}
 			}
 		}
 		return result;
-		// toItemId is derived from rootPath; listing rootPath is sufficient
 		// eslint-disable-next-line react-hooks/exhaustive-deps
 	}, [selected, nodeMap, dirsOnly, rootPath]);
 
-	/**
-	 * Items that are partially selected: NOT in expandedItems themselves but
-	 * have at least one visible descendant that IS in expandedItems.
-	 */
-	const indeterminateItems = useMemo(() => {
+	const indeterminateSet = useMemo(() => {
 		const result = new Set<string>();
 		for (const [id, node] of nodeMap) {
-			if (node.type !== 'dir' || expandedItems.has(id)) continue;
-			const hasCheckedChild = collectDescendants(node).some((d) => {
+			if (node.type !== 'dir' || checkedSet.has(id)) continue;
+			const hasChecked = collectDescendants(node, nodeMap).some(d => {
 				if (dirsOnly && nodeMap.get(d)?.type !== 'dir') return false;
-				return expandedItems.has(d);
+				return checkedSet.has(d);
 			});
-			if (hasCheckedChild) result.add(id);
+			if (hasChecked) result.add(id);
 		}
 		return result;
-	}, [expandedItems, nodeMap, dirsOnly]);
+	}, [checkedSet, nodeMap, dirsOnly]);
 
-	/**
-	 * Direct toggle handler used by custom checkboxes.
-	 * `checked=true`  → add itemId to canonical, remove any descendants it covers.
-	 * `checked=false` → remove itemId, or explode the ancestor that covered it.
-	 */
-	function handleToggle(itemId: string, checked: boolean) {
-		const newCanonical = new Set(selected.map(toItemId));
+	// ── flat list ─────────────────────────────────────────────────────────────
+	const flatItems = useMemo(
+		() => buildFlatList(rootPath, dirs, expandedPaths, 0, dirsOnly),
+		[rootPath, dirs, expandedPaths, dirsOnly],
+	);
 
-		if (checked) {
-			newCanonical.add(itemId);
-			// Remove any descendants that are now covered by this item
-			for (const c of [...newCanonical]) {
-				if (isDescendantOf(c, itemId)) newCanonical.delete(c);
+	// ── virtualizer ───────────────────────────────────────────────────────────
+	const virtualizer = useVirtualizer({
+		count: flatItems.length,
+		getScrollElement: () => containerRef.current,
+		estimateSize: () => ITEM_HEIGHT,
+		overscan: 8,
+		getItemKey: i => flatKey(flatItems[i]),
+	});
+
+	// ── handlers ─────────────────────────────────────────────────────────────
+
+	function toggleExpand(path: string) {
+		const needsLoad = !dirs.has(path);
+		setExpandedPaths(prev => {
+			const next = new Set(prev);
+			next.has(path) ? next.delete(path) : next.add(path);
+			return next;
+		});
+		if (needsLoad) loadDir(path);
+	}
+
+	function handleToggle(itemId: string, chk: boolean) {
+		const canonical = new Set(selected.map(toItemId));
+		if (chk) {
+			canonical.add(itemId);
+			for (const c of [...canonical]) {
+				if (isDescendantOf(c, itemId)) canonical.delete(c);
 			}
-			// Safety: if an ancestor already covers this item, remove the duplicate
-			for (const a of newCanonical) {
+			for (const a of canonical) {
 				if (a !== itemId && isDescendantOf(itemId, a)) {
-					newCanonical.delete(itemId);
+					canonical.delete(itemId);
 					break;
 				}
 			}
 		} else {
-			if (newCanonical.has(itemId)) {
-				newCanonical.delete(itemId);
+			if (canonical.has(itemId)) {
+				canonical.delete(itemId);
 			} else {
-				// Find the ancestor that covers this item and explode it
-				const ancestor = [...newCanonical].find((a) => isDescendantOf(itemId, a));
+				const ancestor = [...canonical].find(a => isDescendantOf(itemId, a));
 				if (ancestor) {
-					newCanonical.delete(ancestor);
-					const ancestorNode = nodeMap.get(ancestor);
-					if (ancestorNode) {
-						explodeExcept(ancestorNode, new Set([itemId]), newCanonical, nodeMap, itemFilter);
-					}
+					canonical.delete(ancestor);
+					const an = nodeMap.get(ancestor);
+					if (an) explodeExcept(an, new Set([itemId]), canonical, nodeMap, itemFilter);
 				}
 			}
 		}
-
-		promote(newCanonical, nodeMap, itemFilter);
-
+		promote(canonical, nodeMap, itemFilter);
 		onChange(
-			[...newCanonical].map((id) => {
+			[...canonical].map(id => {
 				const n = nodeMap.get(id);
 				return n?.type === 'dir' ? id + '/' : id;
 			}),
 		);
 	}
 
-	function handleSingleSelectionChange(_: React.SyntheticEvent, id: string | null) {
-		onChange(id ? [id] : []);
+	function handleRowClick(entry: SftpEntry) {
+		if (entry.type === 'dir') toggleExpand(entry.path);
+		if (!multiSelect) onChange([entry.path]);
 	}
 
-	const isBusy = refreshMut.isPending || isFetching || waiting;
+	// Stable ref wrappers so memoized EntryRow never sees handler identity changes
+	const toggleRef = useRef(handleToggle);
+	toggleRef.current = handleToggle;
+	const stableToggle = useCallback((path: string, chk: boolean) => toggleRef.current(path, chk), []);
+
+	const expandRef = useRef(toggleExpand);
+	expandRef.current = toggleExpand;
+	const stableExpand = useCallback((path: string) => expandRef.current(path), []);
+
+	const rowClickRef = useRef(handleRowClick);
+	rowClickRef.current = handleRowClick;
+	const stableRowClick = useCallback((entry: SftpEntry) => rowClickRef.current(entry), []);
+
+	// ── root row ──────────────────────────────────────────────────────────────
+	const rootLoading = dirs.get(rootPath)?.loading ?? true;
+	const rootChecked = multiSelect && checkedSet.has(rootPath);
+	const rootIndeterminate = multiSelect && !rootChecked && indeterminateSet.has(rootPath);
+	const singleSelectedId = !multiSelect && selected.length > 0 ? toItemId(selected[0]) : null;
 
 	if (nodeId === undefined) {
 		return (
@@ -351,101 +451,137 @@ export function FileBrowser({ nodeId, sftpRoot = '/', selected, onChange, multiS
 		);
 	}
 
-	const rootChecked = expandedItems.has(rootPath);
-	const rootIndeterminate = indeterminateItems.has(rootPath);
-
-	const rootLabel = (
-		<Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75, py: 0.25 }}>
-			{multiSelect && (
-				<Checkbox
-					size='small'
-					checked={rootChecked}
-					indeterminate={rootIndeterminate}
-					onChange={(e) => handleToggle(rootPath, e.target.checked)}
-					onClick={(e) => e.stopPropagation()}
-					sx={{ p: 0.25, ml: -0.5 }}
-					tabIndex={-1}
-				/>
-			)}
-			<Home sx={{ fontSize: 18 }} />
-			<Typography variant='body2' noWrap sx={{ flexGrow: 1, minWidth: 0 }}>
-				{rootPath}
-			</Typography>
-		</Box>
-	);
-
-	const emptyState = (
-		<Box sx={{ textAlign: 'center', py: 3 }}>
-			<Typography variant='body2' color='text.secondary' gutterBottom>
-				No files cached yet.
-			</Typography>
-			<Button size='small' variant='outlined' onClick={() => refreshMut.mutate()} disabled={refreshMut.isPending}>
-				Refresh cache now
-			</Button>
-		</Box>
-	);
-
-	const innerContent = isLoading ? (
-		<Box sx={{ display: 'flex', justifyContent: 'center', py: 2 }}>
-			<CircularProgress size={20} />
-		</Box>
-	) : tree.length === 0 ? (
-		emptyState
-	) : multiSelect ? (
-		tree.map((n) => <MultiSelectItem key={n.path} node={n} dirsOnly={dirsOnly} checkedSet={expandedItems} indeterminateSet={indeterminateItems} onToggle={handleToggle} />)
-	) : (
-		renderTree(tree, dirsOnly)
-	);
-
-	const header = (
-		<Box
-			sx={{
-				display: 'flex',
-				alignItems: 'center',
-				justifyContent: 'space-between',
-				px: 1.5,
-				py: 0.75,
-				borderBottom: 1,
-				borderColor: 'divider',
-				bgcolor: 'action.hover',
-			}}
-		>
-			<Typography variant='caption' color='text.secondary'>
-				{isLoading ? 'Loading…' : waiting ? 'Refreshing cache…' : entries ? `${entries.length} entries cached` : 'No cache loaded'}
-			</Typography>
-			<Tooltip title='Refresh file cache'>
-				<span>
-					<IconButton size='small' onClick={() => refreshMut.mutate()} disabled={isBusy}>
-						{isBusy ? <CircularProgress size={16} /> : <RefreshIcon sx={{ fontSize: 18 }} />}
-					</IconButton>
-				</span>
-			</Tooltip>
-		</Box>
-	);
-
+	// ── render ────────────────────────────────────────────────────────────────
 	return (
 		<Paper variant='outlined' sx={{ overflow: 'hidden' }}>
-			{header}
-			<Box sx={{ maxHeight: 260, overflowY: 'auto', py: 0.5 }}>
-				{multiSelect ? (
-					// MUI selection is disabled — checkboxes are fully managed by us.
-					<SimpleTreeView disableSelection defaultExpandedItems={[rootPath]} sx={{ '& .MuiTreeItem-content': { py: 0.25 } }}>
-						<TreeItem itemId={rootPath} label={rootLabel}>
-							{innerContent}
-						</TreeItem>
-					</SimpleTreeView>
-				) : (
-					<SimpleTreeView
-						selectedItems={selected.length > 0 ? toItemId(selected[0]) : null}
-						defaultExpandedItems={[rootPath]}
-						onSelectedItemsChange={handleSingleSelectionChange}
-						sx={{ '& .MuiTreeItem-content': { py: 0.25 } }}
-					>
-						<TreeItem itemId={rootPath} label={rootLabel}>
-							{innerContent}
-						</TreeItem>
-					</SimpleTreeView>
+			{/* Root row — always pinned above the scroll area */}
+			<Box
+				sx={{
+					display: 'flex',
+					alignItems: 'center',
+					height: ITEM_HEIGHT + 2,
+					px: 1,
+					gap: 0.5,
+					userSelect: 'none',
+					borderBottom: 1,
+					borderColor: 'divider',
+				}}
+			>
+				<Box sx={{ width: 18, flexShrink: 0, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+					{rootLoading && <CircularProgress size={12} />}
+				</Box>
+				{multiSelect && (
+					<Checkbox
+						size='small'
+						checked={rootChecked}
+						indeterminate={rootIndeterminate}
+						onChange={e => handleToggle(rootPath, e.target.checked)}
+						onClick={e => e.stopPropagation()}
+						sx={{ p: 0.25, flexShrink: 0 }}
+						tabIndex={-1}
+					/>
 				)}
+				<Home sx={{ fontSize: 16, flexShrink: 0, color: 'text.secondary' }} />
+				<Typography variant='body2' noWrap sx={{ flexGrow: 1, minWidth: 0, fontWeight: 500 }}>
+					{rootPath}
+				</Typography>
+				{flatItems.filter(i => i.kind === 'entry').length > 0 && (
+					<Typography variant='caption' color='text.secondary' sx={{ flexShrink: 0 }}>
+						{flatItems.filter(i => i.kind === 'entry').length.toLocaleString()} items
+					</Typography>
+				)}
+			</Box>
+
+			{/* Virtualised scroll container */}
+			<Box ref={containerRef} sx={{ height: CONTAINER_HEIGHT, overflowY: 'auto' }}>
+				{/* Spacer that gives the scrollbar its full travel range */}
+				<Box sx={{ height: virtualizer.getTotalSize(), width: '100%', position: 'relative' }}>
+					{virtualizer.getVirtualItems().map(vRow => {
+						const item = flatItems[vRow.index];
+
+						let content: React.ReactNode;
+
+						if (item.kind === 'skel') {
+							const widths = [120, 170, 95] as const;
+							content = (
+								<Box
+									sx={{
+										display: 'flex',
+										alignItems: 'center',
+										height: ITEM_HEIGHT,
+										pl: `${item.depth * 16 + 22}px`,
+										pr: 1,
+									}}
+								>
+									<Skeleton variant='text' width={widths[item.idx]} height={16} />
+								</Box>
+							);
+						} else if (item.kind === 'error') {
+							content = (
+								<Box
+									sx={{
+										height: ITEM_HEIGHT,
+										display: 'flex',
+										alignItems: 'center',
+										pl: `${item.depth * 16 + 22}px`,
+										pr: 1,
+									}}
+								>
+									<Typography variant='caption' color='error'>
+										{item.msg}
+									</Typography>
+								</Box>
+							);
+						} else if (item.kind === 'empty') {
+							content = (
+								<Box
+									sx={{
+										height: ITEM_HEIGHT,
+										display: 'flex',
+										alignItems: 'center',
+										pl: `${item.depth * 16 + 22}px`,
+										pr: 1,
+									}}
+								>
+									<Typography variant='caption' color='text.secondary'>
+										(empty)
+									</Typography>
+								</Box>
+							);
+						} else {
+							// kind === 'entry'
+							content = (
+								<EntryRow
+									entry={item.entry}
+									depth={item.depth}
+									isExpanded={item.isExpanded}
+									checked={checkedSet.has(item.entry.path)}
+									indeterminate={indeterminateSet.has(item.entry.path)}
+									isSelected={singleSelectedId === item.entry.path}
+									multiSelect={multiSelect}
+									onChevron={stableExpand}
+									onCheck={stableToggle}
+									onRowClick={stableRowClick}
+								/>
+							);
+						}
+
+						return (
+							<Box
+								key={vRow.key}
+								sx={{
+									position: 'absolute',
+									top: 0,
+									left: 0,
+									width: '100%',
+									transform: `translateY(${vRow.start}px)`,
+								}}
+							>
+								{content}
+							</Box>
+						);
+					})}
+				</Box>
 			</Box>
 		</Paper>
 	);

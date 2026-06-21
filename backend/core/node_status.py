@@ -35,7 +35,7 @@ async def refresh_node_statuses() -> None:
     async with AsyncSessionLocal() as db:
         # no_autoflush prevents SQLAlchemy from flushing dirty objects mid-loop
         # when db.get() is called on subsequent iterations.
-        async with db.no_autoflush:
+        with db.no_autoflush:
             for item in results:
                 if isinstance(item, Exception):
                     logger.warning("Node status check error: %s", item)
@@ -43,11 +43,14 @@ async def refresh_node_statuses() -> None:
                 node_id, status = item
                 node = await db.get(Node, node_id)
                 if node and node.status != "waking":
+                    transitioning_online = node.status != "online" and status == "online"
                     if node.status != status:
                         changed = True
                     node.status = status
                     if status == "online":
                         node.last_seen = datetime.utcnow()
+                    if transitioning_online:
+                        node.last_active_at = datetime.utcnow()
         await db.commit()
 
     # Only push when something actually flipped so idle clients aren't told to

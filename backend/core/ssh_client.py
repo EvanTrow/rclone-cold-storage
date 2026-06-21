@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import stat as _stat
 from pathlib import Path
 from typing import Optional
 
@@ -76,6 +77,39 @@ async def run_ssh_command(
         return result.exit_status or 0, result.stdout or "", result.stderr or ""
 
 
+async def sftp_list_dir(
+    ip: str,
+    user: str,
+    key_path: Optional[str],
+    port: int = 22,
+    path: str = "/",
+    timeout: int = 15,
+) -> list[dict]:
+    """List immediate children of *path* on the remote SFTP server."""
+    async with asyncssh.connect(**_connect_kwargs(ip, user, key_path, port)) as conn:
+        async with conn.start_sftp_client() as sftp:
+            names = await asyncio.wait_for(sftp.readdir(path), timeout=timeout)
+
+    result = []
+    for item in names:
+        name = item.filename
+        if name in (".", ".."):
+            continue
+        child_path = path.rstrip("/") + "/" + name
+        attrs = item.attrs
+        is_dir = bool(attrs.permissions and _stat.S_ISDIR(attrs.permissions))
+        result.append({
+            "name": name,
+            "path": child_path,
+            "type": "dir" if is_dir else "file",
+            "size_bytes": None if is_dir else attrs.size,
+            "modified_at": None,
+        })
+
+    result.sort(key=lambda e: (0 if e["type"] == "dir" else 1, e["name"].lower()))
+    return result
+
+
 async def shutdown_node(
     ip: str, user: str, key_path: Optional[str], port: int = 22
 ) -> None:
@@ -87,12 +121,16 @@ async def poll_until_reachable(
     user: str,
     key_path: Optional[str],
     port: int = 22,
-    max_retries: int = 30,
+    timeout_secs: int = 300,
     interval: int = 10,
 ) -> bool:
-    for _ in range(max_retries):
+    deadline = asyncio.get_event_loop().time() + timeout_secs
+    while asyncio.get_event_loop().time() < deadline:
         reachable, _ = await test_ssh_connection(ip, user, key_path, port, timeout=interval)
         if reachable:
             return True
-        await asyncio.sleep(interval)
+        remaining = deadline - asyncio.get_event_loop().time()
+        if remaining <= 0:
+            break
+        await asyncio.sleep(min(interval, remaining))
     return False

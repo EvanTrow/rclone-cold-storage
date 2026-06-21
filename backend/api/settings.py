@@ -16,9 +16,8 @@ from backend.models import ApiKey, User
 router = APIRouter(prefix="/api/settings", tags=["settings"])
 
 EDITABLE_KEYS = {
-    "wol_broadcast", "wol_max_retries", "ssh_port",
-    "idle_shutdown_enabled", "idle_shutdown_timeout",
-    "session_expiry_days", "cache_max_depth", "notification_webhook",
+    "wol_broadcast", "ssh_port",
+"session_expiry_days", "cache_max_depth", "notification_webhook",
     "agent_callback_port",
 }
 

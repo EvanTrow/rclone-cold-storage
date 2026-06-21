@@ -56,10 +56,8 @@ export const nodesApi = {
     request(`/api/nodes/${id}/ssh-key`, { method: "DELETE" }),
   testConnection: (id: number) =>
     request<TestConnectionResult>(`/api/nodes/${id}/test-connection`, { method: "POST" }),
-  getFiles: (id: number) =>
-    request<CacheEntry[]>(`/api/nodes/${id}/files`),
-  refreshFiles: (id: number) =>
-    request<{ files: number; dirs: number }>(`/api/nodes/${id}/files/refresh`, { method: "POST" }),
+  browseFiles: (id: number, path: string) =>
+    request<SftpEntry[]>(`/api/nodes/${id}/browse?path=${encodeURIComponent(path)}`),
   wake: (id: number) =>
     request(`/api/nodes/${id}/wake`, { method: "POST" }),
   shutdown: (id: number) =>
@@ -130,8 +128,12 @@ export interface Node {
   ssh_port: number;
   sftp_root: string;
   allow_shutdown: boolean;
+  wol_timeout: number;
+  idle_shutdown_enabled: boolean;
+  idle_shutdown_timeout: number;
   status: "online" | "offline" | "waking" | "unknown";
   last_seen: string | null;
+  last_active_at: string | null;
   last_cache_refresh: string | null;
 }
 
@@ -144,6 +146,9 @@ export interface NodeCreate {
   ssh_port?: number;
   sftp_root?: string;
   allow_shutdown?: boolean;
+  wol_timeout?: number;
+  idle_shutdown_enabled?: boolean;
+  idle_shutdown_timeout?: number;
 }
 
 /** One speed measurement for a given file size. Speeds are bytes/sec. */
@@ -169,10 +174,9 @@ export interface TestConnectionResult {
   speed: SpeedTest | null;
 }
 
-export interface CacheEntry {
-  id: number;
-  path: string;
+export interface SftpEntry {
   name: string;
+  path: string;
   type: "file" | "dir";
   size_bytes: number | null;
   modified_at: string | null;

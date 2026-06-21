@@ -10,13 +10,11 @@ import {
   DialogContent,
   DialogTitle,
   FormControl,
-  FormControlLabel,
   IconButton,
   InputLabel,
   MenuItem,
   Paper,
   Select,
-  Switch,
   Tab,
   Table,
   TableBody,
@@ -84,15 +82,7 @@ function GeneralTab() {
           size="small"
           fullWidth
         />
-        <TextField
-          label="WoL max retries"
-          type="number"
-          value={field("wol_max_retries")}
-          onChange={(e) => set("wol_max_retries", e.target.value)}
-          size="small"
-          fullWidth
-        />
-        <TextField
+<TextField
           label="Session expiry (days)"
           type="number"
           value={field("session_expiry_days")}
@@ -110,32 +100,7 @@ function GeneralTab() {
         />
       </Box>
 
-      <Box sx={{ display: "flex", flexDirection: "column", gap: 1.5, maxWidth: 480 }}>
-        <Typography variant="body2" fontWeight={600}>
-          Idle shutdown
-        </Typography>
-        <FormControlLabel
-          control={
-            <Switch
-              checked={field("idle_shutdown_enabled") === "true"}
-              onChange={(e) => set("idle_shutdown_enabled", e.target.checked ? "true" : "false")}
-              size="small"
-            />
-          }
-          label="Shut down node when idle"
-        />
-        <TextField
-          label="Idle timeout (minutes)"
-          type="number"
-          value={Math.round(parseInt(field("idle_shutdown_timeout") || "3600") / 60)}
-          onChange={(e) => set("idle_shutdown_timeout", String(parseInt(e.target.value || "60") * 60))}
-          size="small"
-          disabled={field("idle_shutdown_enabled") !== "true"}
-          sx={{ maxWidth: 220 }}
-        />
-      </Box>
-
-      <Box
+<Box
         sx={{ display: "flex", flexDirection: "column", gap: 1.5, maxWidth: 480 }}
       >
         <Typography variant="body2" fontWeight={600}>

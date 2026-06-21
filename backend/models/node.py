@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import Boolean, Column, DateTime, Enum as SAEnum, Integer, String
+from sqlalchemy import Boolean, Column, DateTime, Enum as SAEnum, Integer, String, text
 from sqlalchemy.orm import relationship
 
 from .base import Base
@@ -22,7 +22,11 @@ class Node(Base):
         default="unknown",
     )
     allow_shutdown = Column(Boolean, default=True, nullable=False, server_default="1")
+    wol_timeout = Column(Integer, default=300, nullable=False, server_default=text("300"))
+    idle_shutdown_enabled = Column(Boolean, default=False, nullable=False, server_default=text("0"))
+    idle_shutdown_timeout = Column(Integer, default=3600, nullable=False, server_default=text("3600"))
     last_seen = Column(DateTime, nullable=True)
+    last_active_at = Column(DateTime, nullable=True)
     last_cache_refresh = Column(DateTime, nullable=True)
 
     file_cache = relationship("NodeFileCache", back_populates="node", cascade="all, delete-orphan")

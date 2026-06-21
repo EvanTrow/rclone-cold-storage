@@ -4,6 +4,10 @@ services:
     environment:
       ROLE: controller
       DATABASE_URL: sqlite+aiosqlite:////data/rccs.db
+      # SSH keys must live on the volume so they survive image updates.
+      # Changing this path on an existing deployment will orphan stored keys —
+      # re-upload any node SSH keys via the UI after updating.
+      SSH_KEYS_DIR: /data/ssh_keys
     volumes:
       - controller-data:/data
     ports:
@@ -15,6 +19,7 @@ services:
     environment:
       ROLE: node
       DATABASE_URL: sqlite+aiosqlite:////data/rccs.db
+      SSH_KEYS_DIR: /data/ssh_keys
     volumes:
       - node-data:/data
       - /srv/cold-storage:/mnt/storage:ro  # mount your actual cold storage here

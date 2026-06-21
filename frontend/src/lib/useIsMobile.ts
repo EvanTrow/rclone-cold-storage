@@ -1,5 +1,5 @@
-import useMediaQuery from "@mui/material/useMediaQuery";
-import type { Theme } from "@mui/material/styles";
+import useMediaQuery from '@mui/material/useMediaQuery';
+import type { Theme } from '@mui/material/styles';
 
 /**
  * True on phone-width viewports (below the MUI `sm` breakpoint, 600px).
@@ -8,7 +8,7 @@ import type { Theme } from "@mui/material/styles";
  * client-only SPA so there is no server render to match.
  */
 export function useIsMobile(): boolean {
-  return useMediaQuery((theme: Theme) => theme.breakpoints.down("sm"), {
-    noSsr: true,
-  });
+	return useMediaQuery((theme: Theme) => theme.breakpoints.down('md'), {
+		noSsr: true,
+	});
 }
