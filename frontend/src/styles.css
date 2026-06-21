@@ -1,0 +1,19 @@
+@import "tailwindcss";
+
+/* Semantic utilities not covered by MUI sx */
+:root {
+  --c-muted: #6b7280;
+  --c-surface: #f9fafb;
+}
+
+.dark {
+  --c-muted: #9ca3af;
+  --c-surface: #1e1e1e;
+}
+
+.text-muted { color: var(--c-muted); }
+.bg-surface { background-color: var(--c-surface); }
+
+body {
+  margin: 0;
+}

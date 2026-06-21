@@ -1,0 +1,27 @@
+services:
+  controller:
+    build: .
+    environment:
+      ROLE: controller
+      DATABASE_URL: sqlite+aiosqlite:////data/rccs.db
+    volumes:
+      - controller-data:/data
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+
+  node:
+    build: .
+    environment:
+      ROLE: node
+      DATABASE_URL: sqlite+aiosqlite:////data/rccs.db
+    volumes:
+      - node-data:/data
+      - /srv/cold-storage:/mnt/storage:ro  # mount your actual cold storage here
+    ports:
+      - "8001:8000"
+    restart: unless-stopped
+
+volumes:
+  controller-data:
+  node-data:
