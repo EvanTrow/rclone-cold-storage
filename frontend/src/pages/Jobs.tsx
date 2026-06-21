@@ -11,6 +11,7 @@ import {
   DialogTitle,
   FormControl,
   FormControlLabel,
+  FormHelperText,
   IconButton,
   InputLabel,
   MenuItem,
@@ -31,6 +32,26 @@ import { useState } from "react";
 import { ConfirmDialog } from "../components/ConfirmDialog";
 import { FileBrowser } from "../components/FileBrowser";
 import { jobsApi, nodesApi, type Job, type JobCreate } from "../lib/api";
+import { isBlank, isValidCron } from "../lib/validation";
+
+function jobErrors(f: JobCreate): Record<string, string> {
+  const e: Record<string, string> = {};
+  const isDel = f.operation === "delete";
+  if (isBlank(f.name)) e.name = "Job name is required";
+  if (!f.source_node_id) e.source_node = isDel ? "Select a node" : "Select a source node";
+  const paths = isDel ? f.target_paths ?? [] : f.source_paths ?? [];
+  if (paths.length === 0) {
+    e.paths = isDel ? "Add at least one path to delete" : "Add at least one source path";
+  }
+  if (!isDel) {
+    if (!f.dest_node_id) e.dest_node = "Select a destination node";
+    if (isBlank(f.dest_path)) e.dest_path = "Destination path is required";
+  }
+  if (!isBlank(f.schedule_cron) && !isValidCron(f.schedule_cron!)) {
+    e.schedule = "Invalid cron — expects 5 fields, e.g. 0 2 * * 0";
+  }
+  return e;
+}
 
 const EMPTY_FORM: JobCreate = {
   name: "",
@@ -46,10 +67,34 @@ const EMPTY_FORM: JobCreate = {
   run_now: false,
 };
 
+// Single source of truth for how severe each operation is. Drives the table
+// chip color, the inline warnings, and the run-confirmation color so they stay
+// consistent.
+function opSeverity(op: Job["operation"]): "info" | "warning" | "error" {
+  if (op === "delete") return "error";
+  if (op === "move" || op === "sync") return "warning";
+  return "info"; // copy
+}
+
 function opColor(op: Job["operation"]): "default" | "warning" | "error" {
-  if (op === "copy") return "default";
-  if (op === "move") return "warning";
-  return "error";
+  const sev = opSeverity(op);
+  return sev === "info" ? "default" : sev;
+}
+
+function opLabel(op: Job["operation"]): string {
+  return op[0].toUpperCase() + op.slice(1);
+}
+
+// Paths carry a trailing slash for directories; use that to report how many
+// files and folders an operation will touch.
+function describeItems(paths: string[] | null | undefined): string {
+  const list = paths ?? [];
+  const folders = list.filter((p) => p.endsWith("/")).length;
+  const files = list.length - folders;
+  const parts: string[] = [];
+  if (folders) parts.push(`${folders} folder${folders === 1 ? "" : "s"}`);
+  if (files) parts.push(`${files} file${files === 1 ? "" : "s"}`);
+  return parts.length ? parts.join(" and ") : "nothing";
 }
 
 export function Jobs() {
@@ -57,8 +102,10 @@ export function Jobs() {
   const [isOpen, setIsOpen] = useState(false);
   const [editing, setEditing] = useState<Job | null>(null);
   const [form, setForm] = useState<JobCreate>(EMPTY_FORM);
+  const [attempted, setAttempted] = useState(false);
   const [pathInput, setPathInput] = useState("");
   const [deleteTarget, setDeleteTarget] = useState<Job | null>(null);
+  const [runTarget, setRunTarget] = useState<Job | null>(null);
 
   const { data: jobs, isLoading } = useQuery({
     queryKey: ["jobs"],
@@ -97,6 +144,7 @@ export function Jobs() {
   function openCreate() {
     setEditing(null);
     setForm(EMPTY_FORM);
+    setAttempted(false);
     setPathInput("");
     setIsOpen(true);
   }
@@ -116,14 +164,27 @@ export function Jobs() {
       enabled: job.enabled,
       run_now: false,
     });
+    setAttempted(false);
     setPathInput("");
     setIsOpen(true);
+  }
+
+  function handleSave() {
+    if (Object.keys(jobErrors(form)).length > 0) {
+      setAttempted(true);
+      return;
+    }
+    saveMut.mutate(form);
   }
 
   function addPath() {
     if (!pathInput.trim()) return;
     const field = form.operation === "delete" ? "target_paths" : "source_paths";
-    setForm((f) => ({ ...f, [field]: [...(f[field] ?? []), pathInput.trim()] }));
+    // Sync operates on folders only — ensure a trailing slash so the backend
+    // treats the path as a directory.
+    let path = pathInput.trim();
+    if (form.operation === "sync" && !path.endsWith("/")) path += "/";
+    setForm((f) => ({ ...f, [field]: [...(f[field] ?? []), path] }));
     setPathInput("");
   }
 
@@ -133,7 +194,92 @@ export function Jobs() {
   }
 
   const isDelete = form.operation === "delete";
+  const isSync = form.operation === "sync";
   const activePaths = isDelete ? (form.target_paths ?? []) : (form.source_paths ?? []);
+
+  const errors = jobErrors(form);
+  const hasErrors = Object.keys(errors).length > 0;
+  const showError = (k: string) => (attempted ? errors[k] : undefined);
+
+  function nodeName(id: number | null): string {
+    return nodes?.find((n) => n.id === id)?.name ?? "an unknown node";
+  }
+
+  function describeRun(job: Job): string {
+    const src = nodeName(job.source_node_id);
+    const dst = nodeName(job.dest_node_id);
+    switch (job.operation) {
+      case "copy":
+        return `This will copy ${describeItems(job.source_paths)} from "${src}" to "${dst}" at ${job.dest_path || "the destination root"}. Existing files on the destination are left in place.`;
+      case "move":
+        return `This will move ${describeItems(job.source_paths)} from "${src}" to "${dst}" at ${job.dest_path || "the destination root"}. Each item is copied, verified by checksum, then deleted from the source.`;
+      case "sync":
+        return `This will sync ${describeItems(job.source_paths)} from "${src}" to "${dst}", making the destination identical to the source. Files on the destination that are not in the source will be permanently deleted.`;
+      case "delete": {
+        const node = nodeName(job.source_node_id ?? job.dest_node_id);
+        return `This will permanently delete ${describeItems(job.target_paths)} from "${node}". This cannot be undone.`;
+      }
+    }
+  }
+
+  function runDetails(job: Job) {
+    const paths =
+      job.operation === "delete" ? job.target_paths ?? [] : job.source_paths ?? [];
+    const showDest = job.operation !== "delete";
+    return (
+      <>
+        <Box component="span" sx={{ display: "block", mb: 1.5 }}>
+          {describeRun(job)}
+        </Box>
+
+        <Typography variant="caption" color="text.secondary" sx={{ display: "block" }}>
+          {job.operation === "delete" ? "Paths to delete" : "Source paths"}
+        </Typography>
+        <Box component="ul" sx={{ mt: 0.5, mb: showDest ? 1.5 : 0, pl: 2.5 }}>
+          {paths.length === 0 ? (
+            <Typography
+              component="li"
+              variant="body2"
+              color="text.secondary"
+              sx={{ fontStyle: "italic" }}
+            >
+              none selected
+            </Typography>
+          ) : (
+            paths.map((p) => (
+              <Typography
+                component="li"
+                key={p}
+                variant="body2"
+                sx={{ fontFamily: "monospace", wordBreak: "break-all" }}
+              >
+                {p}
+              </Typography>
+            ))
+          )}
+        </Box>
+
+        {showDest && (
+          <>
+            <Typography variant="caption" color="text.secondary" sx={{ display: "block" }}>
+              Destination
+            </Typography>
+            <Typography
+              variant="body2"
+              sx={{ fontFamily: "monospace", wordBreak: "break-all", mt: 0.5 }}
+            >
+              {nodeName(job.dest_node_id)}:{job.dest_path || "(root)"}
+            </Typography>
+          </>
+        )}
+      </>
+    );
+  }
+
+  function runConfirmColor(op: Job["operation"]): "error" | "warning" | "primary" {
+    const sev = opSeverity(op);
+    return sev === "info" ? "primary" : sev;
+  }
 
   return (
     <Box sx={{ display: "flex", flexDirection: "column", gap: 3 }}>
@@ -212,15 +358,18 @@ export function Jobs() {
                       <Button
                         size="small"
                         variant="outlined"
-                        disabled={triggerMut.isPending}
+                        disabled={
+                          triggerMut.isPending && triggerMut.variables === job.id
+                        }
                         startIcon={
-                          triggerMut.isPending ? (
+                          triggerMut.isPending &&
+                          triggerMut.variables === job.id ? (
                             <CircularProgress size={12} />
                           ) : undefined
                         }
-                        onClick={() => triggerMut.mutate(job.id)}
+                        onClick={() => setRunTarget(job)}
                       >
-                        Run now
+                        {`Run ${opLabel(job.operation)}`}
                       </Button>
                       <Button
                         size="small"
@@ -264,34 +413,50 @@ export function Jobs() {
               required
               size="small"
               fullWidth
+              error={!!showError("name")}
+              helperText={showError("name")}
             />
 
             <FormControl size="small" fullWidth>
               <InputLabel>Operation</InputLabel>
               <Select
                 value={form.operation}
-                onChange={(e) =>
+                onChange={(e) => {
+                  const operation = e.target.value as JobCreate["operation"];
                   setForm((f) => ({
                     ...f,
-                    operation: e.target.value as JobCreate["operation"],
-                  }))
-                }
+                    operation,
+                    // Sync operates on folders only — drop any already-selected files.
+                    source_paths:
+                      operation === "sync"
+                        ? (f.source_paths ?? []).filter((p) => p.endsWith("/"))
+                        : f.source_paths,
+                  }));
+                }}
                 label="Operation"
               >
                 <MenuItem value="copy">Copy</MenuItem>
                 <MenuItem value="move">Move</MenuItem>
+                <MenuItem value="sync">Sync</MenuItem>
                 <MenuItem value="delete">Delete</MenuItem>
               </Select>
             </FormControl>
 
             {isDelete && (
-              <Alert severity="warning">
+              <Alert severity={opSeverity("delete")}>
                 Delete jobs permanently remove files from the node. This cannot be undone.
               </Alert>
             )}
 
-            <FormControl size="small" fullWidth>
-              <InputLabel>{isDelete ? "Node" : "Source node"}</InputLabel>
+            {isSync && (
+              <Alert severity={opSeverity("sync")}>
+                Sync makes the destination identical to the source. Files on the destination
+                that are not on the source will be permanently deleted.
+              </Alert>
+            )}
+
+            <FormControl size="small" fullWidth error={!!showError("source_node")}>
+              <InputLabel shrink>{isDelete ? "Node" : "Source node"}</InputLabel>
               <Select
                 value={form.source_node_id ? String(form.source_node_id) : ""}
                 onChange={(e) =>
@@ -302,6 +467,7 @@ export function Jobs() {
                 }
                 label={isDelete ? "Node" : "Source node"}
                 displayEmpty
+                notched
               >
                 <MenuItem value=""><em>Select a node</em></MenuItem>
                 {(nodes ?? []).map((n) => (
@@ -310,12 +476,20 @@ export function Jobs() {
                   </MenuItem>
                 ))}
               </Select>
+              {showError("source_node") && (
+                <FormHelperText>{showError("source_node")}</FormHelperText>
+              )}
             </FormControl>
 
             <Box>
               <Typography variant="body2" fontWeight={500} gutterBottom>
-                {isDelete ? "Paths to delete" : "Source paths"}
+                {isDelete ? "Paths to delete" : isSync ? "Source folders" : "Source paths"}
               </Typography>
+              {showError("paths") && (
+                <FormHelperText error sx={{ mx: 0, mb: 0.5 }}>
+                  {showError("paths")}
+                </FormHelperText>
+              )}
               <FileBrowser
                 nodeId={form.source_node_id}
                 selected={activePaths}
@@ -324,6 +498,7 @@ export function Jobs() {
                   setForm((f) => ({ ...f, [field]: paths }));
                 }}
                 multiSelect
+                dirsOnly={isSync}
               />
               <Box sx={{ display: "flex", gap: 1, mt: 1 }}>
                 <TextField
@@ -370,8 +545,8 @@ export function Jobs() {
 
             {!isDelete && (
               <>
-                <FormControl size="small" fullWidth>
-                  <InputLabel>Destination node</InputLabel>
+                <FormControl size="small" fullWidth error={!!showError("dest_node")}>
+                  <InputLabel shrink>Destination node</InputLabel>
                   <Select
                     value={form.dest_node_id ? String(form.dest_node_id) : ""}
                     onChange={(e) => {
@@ -380,11 +555,12 @@ export function Jobs() {
                       setForm((f) => ({
                         ...f,
                         dest_node_id: nodeId,
-                        dest_path: f.dest_path || node?.sftp_root || "",
+                        dest_path: node?.sftp_root || "",
                       }));
                     }}
                     label="Destination node"
                     displayEmpty
+                    notched
                   >
                     <MenuItem value=""><em>Select a node</em></MenuItem>
                     {(nodes ?? []).map((n) => (
@@ -393,6 +569,9 @@ export function Jobs() {
                       </MenuItem>
                     ))}
                   </Select>
+                  {showError("dest_node") && (
+                    <FormHelperText>{showError("dest_node")}</FormHelperText>
+                  )}
                 </FormControl>
 
                 <TextField
@@ -404,6 +583,8 @@ export function Jobs() {
                   placeholder="/backups/"
                   size="small"
                   fullWidth
+                  error={!!showError("dest_path")}
+                  helperText={showError("dest_path")}
                 />
 
                 <Box>
@@ -435,6 +616,8 @@ export function Jobs() {
               placeholder="0 2 * * 0"
               size="small"
               fullWidth
+              error={!!showError("schedule")}
+              helperText={showError("schedule")}
             />
 
             <Box sx={{ display: "flex", gap: 3, flexWrap: "wrap" }}>
@@ -482,11 +665,11 @@ export function Jobs() {
           </Button>
           <Button
             variant="contained"
-            disabled={saveMut.isPending}
+            disabled={saveMut.isPending || (attempted && hasErrors)}
             startIcon={
               saveMut.isPending ? <CircularProgress size={14} color="inherit" /> : undefined
             }
-            onClick={() => saveMut.mutate(form)}
+            onClick={handleSave}
           >
             Save
           </Button>
@@ -500,6 +683,16 @@ export function Jobs() {
         confirmLabel="Delete"
         onConfirm={() => deleteMut.mutate(deleteTarget!.id)}
         onClose={() => setDeleteTarget(null)}
+      />
+
+      <ConfirmDialog
+        open={!!runTarget}
+        title={`Run "${runTarget?.name}"?`}
+        message={runTarget ? runDetails(runTarget) : ""}
+        confirmLabel={runTarget ? `Run ${opLabel(runTarget.operation)}` : "Run"}
+        confirmColor={runTarget ? runConfirmColor(runTarget.operation) : "primary"}
+        onConfirm={() => triggerMut.mutate(runTarget!.id)}
+        onClose={() => setRunTarget(null)}
       />
     </Box>
   );

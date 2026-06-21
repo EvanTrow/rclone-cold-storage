@@ -6,11 +6,12 @@ import {
   DialogContentText,
   DialogTitle,
 } from "@mui/material";
+import type { ReactNode } from "react";
 
 interface Props {
   open: boolean;
   title: string;
-  message: string;
+  message: ReactNode;
   confirmLabel?: string;
   confirmColor?: "error" | "warning" | "primary";
   onConfirm: () => void;
@@ -30,7 +31,7 @@ export function ConfirmDialog({
     <Dialog open={open} onClose={onClose} maxWidth="xs" fullWidth>
       <DialogTitle>{title}</DialogTitle>
       <DialogContent>
-        <DialogContentText>{message}</DialogContentText>
+        <DialogContentText component="div">{message}</DialogContentText>
       </DialogContent>
       <DialogActions>
         <Button variant="text" onClick={onClose}>

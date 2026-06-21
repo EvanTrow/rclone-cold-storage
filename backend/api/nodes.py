@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.core.config import get_setting
 from backend.core.deps import get_current_user, require_admin
+from backend.core.rclone_runner import speed_test
 from backend.core.ssh_client import shutdown_node, test_ssh_connection
 from backend.core.ssh_key_store import delete_key, save_key
 from backend.core.wol import send_wol
@@ -161,7 +162,30 @@ async def test_connection(
     reachable, error = await test_ssh_connection(
         node.ip, node.ssh_user, node.ssh_key_path, node.ssh_port
     )
-    return {"reachable": reachable, "error": error}
+
+    # Only measure transfer speed once we know SSH is up — the speed test
+    # reaches the same host over SFTP and would otherwise just hang/fail.
+    speed = None
+    if reachable:
+        result = await speed_test(
+            node.ip, node.ssh_user, node.ssh_key_path, node.ssh_port, node.sftp_root
+        )
+        speed = {
+            "upload_bps": result.upload_bps,
+            "download_bps": result.download_bps,
+            "samples": [
+                {
+                    "size_bytes": s.size_bytes,
+                    "num_files": s.num_files,
+                    "upload_bps": s.upload_bps,
+                    "download_bps": s.download_bps,
+                }
+                for s in result.samples
+            ],
+            "error": result.error,
+        }
+
+    return {"reachable": reachable, "error": error, "speed": speed}
 
 
 @router.post("/{node_id}/shutdown", status_code=204)

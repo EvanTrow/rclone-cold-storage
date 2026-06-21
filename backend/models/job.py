@@ -9,7 +9,7 @@ class Job(Base):
 
     id = Column(Integer, primary_key=True)
     name = Column(String, nullable=False)
-    operation = Column(SAEnum("copy", "move", "delete", name="job_operation"), nullable=False)
+    operation = Column(SAEnum("copy", "move", "sync", "delete", name="job_operation"), nullable=False)
     source_node_id = Column(Integer, ForeignKey("nodes.id"), nullable=True)
     source_paths = Column(JSON, nullable=True)
     dest_node_id = Column(Integer, ForeignKey("nodes.id"), nullable=True)

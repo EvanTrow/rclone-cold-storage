@@ -33,7 +33,7 @@ def _job_dict(j: Job) -> dict:
 
 class JobCreate(BaseModel):
     name: str
-    operation: str  # copy | move | delete
+    operation: str  # copy | move | sync | delete
     source_node_id: Optional[int] = None
     source_paths: Optional[list[str]] = None
     dest_node_id: Optional[int] = None

@@ -1,6 +1,8 @@
-import { createTheme, CssBaseline, ThemeProvider } from "@mui/material";
+import CloseIcon from "@mui/icons-material/Close";
+import { createTheme, CssBaseline, IconButton, ThemeProvider } from "@mui/material";
 import useMediaQuery from "@mui/material/useMediaQuery";
 import { QueryClientProvider } from "@tanstack/react-query";
+import { closeSnackbar, SnackbarProvider } from "notistack";
 import { StrictMode, useMemo } from "react";
 import { createRoot } from "react-dom/client";
 import { RouterProvider } from "react-router-dom";
@@ -24,7 +26,23 @@ function App() {
   return (
     <ThemeProvider theme={theme}>
       <CssBaseline />
-      <RouterProvider router={router} />
+      <SnackbarProvider
+        maxSnack={3}
+        anchorOrigin={{ vertical: "bottom", horizontal: "right" }}
+        autoHideDuration={8000}
+        action={(snackbarId) => (
+          <IconButton
+            size="small"
+            color="inherit"
+            aria-label="Dismiss"
+            onClick={() => closeSnackbar(snackbarId)}
+          >
+            <CloseIcon fontSize="small" />
+          </IconButton>
+        )}
+      >
+        <RouterProvider router={router} />
+      </SnackbarProvider>
     </ThemeProvider>
   );
 }

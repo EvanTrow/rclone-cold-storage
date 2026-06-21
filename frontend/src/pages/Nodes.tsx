@@ -22,9 +22,65 @@ import {
   Typography,
 } from "@mui/material";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useSnackbar } from "notistack";
 import { useRef, useState } from "react";
 import { ConfirmDialog } from "../components/ConfirmDialog";
-import { nodesApi, type Node, type NodeCreate } from "../lib/api";
+import { nodesApi, type Node, type NodeCreate, type SpeedTest } from "../lib/api";
+import {
+  isAbsolutePath,
+  isBlank,
+  isValidHost,
+  isValidMac,
+  isValidPort,
+} from "../lib/validation";
+
+function formatBps(n: number): string {
+  if (n < 1024) return `${n.toFixed(0)} B/s`;
+  if (n < 1024 ** 2) return `${(n / 1024).toFixed(1)} KiB/s`;
+  if (n < 1024 ** 3) return `${(n / 1024 ** 2).toFixed(1)} MiB/s`;
+  return `${(n / 1024 ** 3).toFixed(2)} GiB/s`;
+}
+
+function formatSize(n: number): string {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 ** 2) return `${(n / 1024).toFixed(0)} KiB`;
+  if (n < 1024 ** 3) return `${(n / 1024 ** 2).toFixed(0)} MiB`;
+  return `${(n / 1024 ** 3).toFixed(1)} GiB`;
+}
+
+/** Rich snackbar body: headline peak speeds plus a per-file-size breakdown. */
+function speedSnackContent(title: string, speed: SpeedTest) {
+  return (
+    <Box sx={{ display: "flex", flexDirection: "column", gap: 0.25 }}>
+      <Typography variant="body2" fontWeight={600}>
+        {title}
+      </Typography>
+      <Typography variant="body2">
+        ↑ {formatBps(speed.upload_bps)} · ↓ {formatBps(speed.download_bps)} (peak)
+      </Typography>
+      {speed.samples.map((s) => (
+        <Typography key={s.size_bytes} variant="caption">
+          {formatSize(s.size_bytes)}: ↑ {formatBps(s.upload_bps)} · ↓ {formatBps(s.download_bps)}
+        </Typography>
+      ))}
+    </Box>
+  );
+}
+
+function nodeErrors(f: NodeCreate): Partial<Record<keyof NodeCreate, string>> {
+  const e: Partial<Record<keyof NodeCreate, string>> = {};
+  if (isBlank(f.name)) e.name = "Name is required";
+  if (isBlank(f.ip)) e.ip = "IP address is required";
+  else if (!isValidHost(f.ip)) e.ip = "Enter a valid IP address or hostname";
+  if (isBlank(f.mac)) e.mac = "MAC address is required";
+  else if (!isValidMac(f.mac)) e.mac = "Format: 00:1A:2B:3C:4D:5E";
+  if (isBlank(f.ssh_user)) e.ssh_user = "SSH user is required";
+  if (!isValidPort(f.ssh_port ?? 22)) e.ssh_port = "Port must be between 1 and 65535";
+  const root = f.sftp_root ?? "/";
+  if (isBlank(root)) e.sftp_root = "SFTP root is required";
+  else if (!isAbsolutePath(root)) e.sftp_root = "Must be an absolute path (start with /)";
+  return e;
+}
 
 const EMPTY: NodeCreate = {
   name: "",
@@ -41,9 +97,10 @@ export function Nodes() {
   const [isOpen, setIsOpen] = useState(false);
   const [editing, setEditing] = useState<Node | null>(null);
   const [form, setForm] = useState<NodeCreate>(EMPTY);
-  const [testResult, setTestResult] = useState<
-    Record<number, { ok: boolean | null; error?: string }>
-  >({});
+  const [attempted, setAttempted] = useState(false);
+  // Per-row button status only; detailed results/errors surface via snackbars.
+  const [testResult, setTestResult] = useState<Record<number, { ok: boolean | null }>>({});
+  const { enqueueSnackbar } = useSnackbar();
 
   const keyInputRef = useRef<HTMLInputElement>(null);
   const [keyFile, setKeyFile] = useState<File | null>(null);
@@ -99,6 +156,7 @@ export function Nodes() {
   function openCreate() {
     setEditing(null);
     setForm(EMPTY);
+    setAttempted(false);
     resetKeyState();
     setIsOpen(true);
   }
@@ -114,8 +172,17 @@ export function Nodes() {
       sftp_root: node.sftp_root,
       allow_shutdown: node.allow_shutdown,
     });
+    setAttempted(false);
     resetKeyState();
     setIsOpen(true);
+  }
+
+  function handleSave() {
+    if (Object.keys(nodeErrors(form)).length > 0) {
+      setAttempted(true);
+      return;
+    }
+    saveMut.mutate(form);
   }
 
   async function handleKeyFile(e: React.ChangeEvent<HTMLInputElement>) {
@@ -128,11 +195,34 @@ export function Nodes() {
 
   async function testConn(node: Node) {
     setTestResult((p) => ({ ...p, [node.id]: { ok: null } }));
-    const res = await nodesApi.testConnection(node.id);
-    setTestResult((p) => ({
-      ...p,
-      [node.id]: { ok: res.reachable, error: res.error ?? undefined },
-    }));
+    try {
+      const res = await nodesApi.testConnection(node.id);
+      setTestResult((p) => ({ ...p, [node.id]: { ok: res.reachable } }));
+
+      if (!res.reachable) {
+        enqueueSnackbar(`${node.name}: ${res.error ?? "SSH connection failed"}`, {
+          variant: "error",
+          autoHideDuration: 12000,
+        });
+      } else if (res.speed?.error) {
+        enqueueSnackbar(`${node.name} reachable, but speed test failed: ${res.speed.error}`, {
+          variant: "warning",
+          autoHideDuration: 12000,
+        });
+      } else if (res.speed) {
+        enqueueSnackbar(speedSnackContent(`${node.name} is online`, res.speed), {
+          variant: "success",
+        });
+      } else {
+        enqueueSnackbar(`${node.name} is online — SSH connection OK`, { variant: "success" });
+      }
+    } catch (e) {
+      setTestResult((p) => ({ ...p, [node.id]: { ok: false } }));
+      enqueueSnackbar(`${node.name}: ${e instanceof Error ? e.message : "Test failed"}`, {
+        variant: "error",
+        autoHideDuration: 12000,
+      });
+    }
   }
 
   function field<K extends keyof NodeCreate>(key: K) {
@@ -144,6 +234,10 @@ export function Nodes() {
   }
 
   const existingKeyIntact = editing?.has_ssh_key && !removeKey && !keyContent;
+
+  const errors = nodeErrors(form);
+  const hasErrors = Object.keys(errors).length > 0;
+  const showError = (k: keyof NodeCreate) => (attempted ? errors[k] : undefined);
 
   return (
     <Box sx={{ display: "flex", flexDirection: "column", gap: 3 }}>
@@ -235,30 +329,19 @@ export function Nodes() {
                         >
                           Edit
                         </Button>
-                        <Box sx={{ display: "flex", flexDirection: "column", gap: 0.5 }}>
-                          <Button
-                            size="small"
-                            variant="outlined"
-                            onClick={() => testConn(node)}
-                          >
-                            {!testResult[node.id]
-                              ? "Test"
-                              : testResult[node.id].ok === null
-                                ? "Testing…"
-                                : testResult[node.id].ok
-                                  ? "✓ Online"
-                                  : "✗ Failed"}
-                          </Button>
-                          {testResult[node.id]?.error && (
-                            <Typography
-                              variant="caption"
-                              color="error"
-                              sx={{ maxWidth: 192 }}
-                            >
-                              {testResult[node.id].error}
-                            </Typography>
-                          )}
-                        </Box>
+                        <Button
+                          size="small"
+                          variant="outlined"
+                          onClick={() => testConn(node)}
+                        >
+                          {!testResult[node.id]
+                            ? "Test"
+                            : testResult[node.id].ok === null
+                              ? "Testing…"
+                              : testResult[node.id].ok
+                                ? "✓ Online"
+                                : "✗ Failed"}
+                        </Button>
                         {isOnline ? (
                           <Button
                             size="small"
@@ -352,6 +435,8 @@ export function Nodes() {
               required
               size="small"
               fullWidth
+              error={!!showError("name")}
+              helperText={showError("name")}
             />
             <TextField
               label="IP address"
@@ -360,6 +445,8 @@ export function Nodes() {
               required
               size="small"
               fullWidth
+              error={!!showError("ip")}
+              helperText={showError("ip")}
             />
             <TextField
               label="MAC address"
@@ -369,6 +456,8 @@ export function Nodes() {
               size="small"
               fullWidth
               inputProps={{ style: { fontFamily: "monospace" } }}
+              error={!!showError("mac")}
+              helperText={showError("mac")}
             />
             <TextField
               label="SSH user"
@@ -377,6 +466,8 @@ export function Nodes() {
               required
               size="small"
               fullWidth
+              error={!!showError("ssh_user")}
+              helperText={showError("ssh_user")}
             />
             <TextField
               label="SSH port"
@@ -385,6 +476,8 @@ export function Nodes() {
               onChange={(e) => set("ssh_port", Number(e.target.value))}
               size="small"
               fullWidth
+              error={!!showError("ssh_port")}
+              helperText={showError("ssh_port")}
             />
             <TextField
               label="SFTP root"
@@ -392,6 +485,8 @@ export function Nodes() {
               onChange={(e) => set("sftp_root", e.target.value)}
               size="small"
               fullWidth
+              error={!!showError("sftp_root")}
+              helperText={showError("sftp_root")}
             />
 
             <Box sx={{ gridColumn: "1 / -1" }}>
@@ -490,11 +585,11 @@ export function Nodes() {
           </Button>
           <Button
             variant="contained"
-            disabled={saveMut.isPending}
+            disabled={saveMut.isPending || (attempted && hasErrors)}
             startIcon={
               saveMut.isPending ? <CircularProgress size={14} color="inherit" /> : undefined
             }
-            onClick={() => saveMut.mutate(form)}
+            onClick={handleSave}
           >
             Save
           </Button>

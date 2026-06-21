@@ -55,7 +55,7 @@ export const nodesApi = {
   deleteSSHKey: (id: number) =>
     request(`/api/nodes/${id}/ssh-key`, { method: "DELETE" }),
   testConnection: (id: number) =>
-    request<{ reachable: boolean; error: string | null }>(`/api/nodes/${id}/test-connection`, { method: "POST" }),
+    request<TestConnectionResult>(`/api/nodes/${id}/test-connection`, { method: "POST" }),
   getFiles: (id: number) =>
     request<CacheEntry[]>(`/api/nodes/${id}/files`),
   refreshFiles: (id: number) =>
@@ -144,6 +144,29 @@ export interface NodeCreate {
   allow_shutdown?: boolean;
 }
 
+/** One speed measurement for a given file size. Speeds are bytes/sec. */
+export interface SpeedSample {
+  size_bytes: number;
+  num_files: number;
+  upload_bps: number;
+  download_bps: number;
+}
+
+export interface SpeedTest {
+  /** Peak speeds across all samples, bytes/sec. */
+  upload_bps: number;
+  download_bps: number;
+  samples: SpeedSample[];
+  error: string | null;
+}
+
+export interface TestConnectionResult {
+  reachable: boolean;
+  error: string | null;
+  /** null when SSH was unreachable, so the speed test was skipped. */
+  speed: SpeedTest | null;
+}
+
 export interface CacheEntry {
   id: number;
   path: string;
@@ -156,7 +179,7 @@ export interface CacheEntry {
 export interface Job {
   id: number;
   name: string;
-  operation: "copy" | "move" | "delete";
+  operation: "copy" | "move" | "sync" | "delete";
   source_node_id: number | null;
   source_paths: string[] | null;
   dest_node_id: number | null;
@@ -169,7 +192,7 @@ export interface Job {
 
 export interface JobCreate {
   name: string;
-  operation: "copy" | "move" | "delete";
+  operation: "copy" | "move" | "sync" | "delete";
   source_node_id?: number;
   source_paths?: string[];
   dest_node_id?: number;

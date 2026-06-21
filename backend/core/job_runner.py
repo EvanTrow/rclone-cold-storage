@@ -168,6 +168,8 @@ async def _run_job(
         await _do_copy(db, job, run, log, flush_log, on_rclone_line)
     elif job.operation == "move":
         await _do_move(db, job, run, log, flush_log, on_rclone_line)
+    elif job.operation == "sync":
+        await _do_sync(db, job, run, log, flush_log, on_rclone_line)
     elif job.operation == "delete":
         await _do_delete(db, job, run, log, flush_log, on_rclone_line)
 
@@ -242,6 +244,31 @@ async def _do_copy(db, job, run, log, flush_log, on_rclone_line) -> None:
         run.bytes_transferred = (run.bytes_transferred or 0) + result.bytes_transferred
         run.files_transferred = (run.files_transferred or 0) + result.files_transferred
         log(f"Copy complete: {result.files_transferred} files, {_fmt_bytes(result.bytes_transferred)}")
+    run.status = "success"
+
+
+async def _do_sync(db, job, run, log, flush_log, on_rclone_line) -> None:
+    src = await db.get(Node, job.source_node_id)
+    dst = await db.get(Node, job.dest_node_id)
+    for path in (job.source_paths or []):
+        dest = _dest_dir(path, src.sftp_root, dst.sftp_root)
+        log(f"Syncing {src.name}:{path} → {dst.name}:{dest} (extra files on dest will be deleted)")
+        await flush_log()
+        result = await rclone_runner.sync(
+            src.ip, src.ssh_user, src.ssh_key_path, src.ssh_port, path,
+            dst.ip, dst.ssh_user, dst.ssh_key_path, dst.ssh_port, dest,
+            on_line=on_rclone_line,
+        )
+        if result.exit_code != 0:
+            log(f"rclone sync failed (exit {result.exit_code})")
+            run.status = "failed"
+            run.alert_read = False
+            run.bytes_transferred = result.bytes_transferred
+            run.files_transferred = result.files_transferred
+            return
+        run.bytes_transferred = (run.bytes_transferred or 0) + result.bytes_transferred
+        run.files_transferred = (run.files_transferred or 0) + result.files_transferred
+        log(f"Sync complete: {result.files_transferred} files, {_fmt_bytes(result.bytes_transferred)}")
     run.status = "success"
 
 
