@@ -6,7 +6,6 @@ __pycache__/
 .venv-wsl/
 venv/
 .env
-*.db
 
 # Node
 frontend/node_modules/
@@ -24,3 +23,4 @@ frontend/.vite/
 .DS_Store
 
 data/
+rccs.db*
