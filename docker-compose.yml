@@ -8,10 +8,11 @@ services:
       # Changing this path on an existing deployment will orphan stored keys —
       # re-upload any node SSH keys via the UI after updating.
       SSH_KEYS_DIR: /data/ssh_keys
+      PORT: ${CONTROLLER_PORT:-8000}
     volumes:
       - controller-data:/data
     ports:
-      - "8000:8000"
+      - "${CONTROLLER_PORT:-8000}:${CONTROLLER_PORT:-8000}"
     restart: unless-stopped
 
   node:
@@ -20,11 +21,12 @@ services:
       ROLE: node
       DATABASE_URL: sqlite+aiosqlite:////data/rccs.db
       SSH_KEYS_DIR: /data/ssh_keys
+      PORT: ${NODE_PORT:-8001}
     volumes:
       - node-data:/data
       - /srv/cold-storage:/mnt/storage:ro  # mount your actual cold storage here
     ports:
-      - "8001:8000"
+      - "${NODE_PORT:-8001}:${NODE_PORT:-8001}"
     restart: unless-stopped
 
 volumes:

@@ -44,9 +44,10 @@ COPY --from=frontend-build /app/frontend/dist ./frontend/dist
 
 ENV ROLE=controller
 ENV DATABASE_URL=sqlite+aiosqlite:////data/rccs.db
+ENV PORT=8000
 
 VOLUME /data
 
 EXPOSE 8000
 
-CMD ["uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD uvicorn backend.main:app --host 0.0.0.0 --port ${PORT}
