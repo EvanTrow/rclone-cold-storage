@@ -1,8 +1,11 @@
 import CloseIcon from '@mui/icons-material/Close';
 import { Box, Button, Chip, CircularProgress, Drawer, IconButton, Paper, Table, TableBody, TableCell, TableContainer, TableHead, TableRow, Typography } from '@mui/material';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, useCallback } from 'react';
+import { ConfirmDialog } from '../components/ConfirmDialog';
+import { DataCard } from '../components/DataCard';
 import { jobsApi, runsApi, type Run } from '../lib/api';
+import { useIsMobile } from '../lib/useIsMobile';
 
 function statusColor(s: Run['status']): 'success' | 'error' | 'warning' | 'default' {
 	if (s === 'success') return 'success';
@@ -88,13 +91,19 @@ function LogViewer({ log, isLive }: { log: string | undefined; isLive: boolean }
 
 export function History() {
 	const qc = useQueryClient();
+	const isMobile = useIsMobile();
 	const [selected, setSelected] = useState<Run | null>(null);
 	const [drawerOpen, setDrawerOpen] = useState(false);
+	const [confirmClear, setConfirmClear] = useState(false);
+
+	// Incremental log accumulation — null means "not yet loaded" (show spinner).
+	const [localLog, setLocalLog] = useState<string | null>(null);
+	const logFromRef = useRef(0);
 
 	const { data: runs, isLoading } = useQuery({
 		queryKey: ['runs'],
 		queryFn: () => runsApi.list(),
-		refetchInterval: 10_000,
+		refetchInterval: 60_000,
 	});
 
 	const { data: jobs } = useQuery({
@@ -104,12 +113,33 @@ export function History() {
 
 	const isLive = selected?.status === 'running' || selected?.status === 'queued';
 
-	const { data: runDetail, isLoading: detailLoading } = useQuery({
+	// Reset log buffer whenever a different run is opened.
+	useEffect(() => {
+		setLocalLog(null);
+		logFromRef.current = 0;
+	}, [selected?.id]);
+
+	// queryFn reads logFromRef at call time so the queryKey stays stable.
+	const selectedId = selected?.id;
+	const detailQueryFn = useCallback(
+		() => runsApi.get(selectedId!, logFromRef.current),
+		[selectedId],
+	);
+
+	const { data: runDetail } = useQuery({
 		queryKey: ['run', selected?.id],
-		queryFn: () => runsApi.get(selected!.id),
+		queryFn: detailQueryFn,
 		enabled: !!selected,
-		refetchInterval: isLive ? 3_000 : false,
+		refetchInterval: isLive ? 10_000 : false,
 	});
+
+	// Append the incoming delta to the local log buffer and advance the offset.
+	useEffect(() => {
+		if (!runDetail) return;
+		const incoming = runDetail.log_output ?? '';
+		setLocalLog((prev) => (prev === null ? incoming : prev + incoming));
+		logFromRef.current = runDetail.log_length ?? (logFromRef.current + incoming.length);
+	}, [runDetail]);
 
 	useEffect(() => {
 		if (!selected || !runs) return;
@@ -119,6 +149,16 @@ export function History() {
 
 	const markAllMut = useMutation({
 		mutationFn: runsApi.markAllRead,
+		onSuccess: () => qc.invalidateQueries({ queryKey: ['runs'] }),
+	});
+
+	const ackMut = useMutation({
+		mutationFn: (id: number) => runsApi.markRead(id),
+		onSuccess: () => qc.invalidateQueries({ queryKey: ['runs'] }),
+	});
+
+	const clearMut = useMutation({
+		mutationFn: runsApi.clearAll,
 		onSuccess: () => qc.invalidateQueries({ queryKey: ['runs'] }),
 	});
 
@@ -143,6 +183,32 @@ export function History() {
 
 	const displayRun = runDetail ?? selected;
 
+	// A failed run whose alert hasn't been acknowledged yet.
+	function isUnreadFailure(run: Run) {
+		return !run.alert_read && run.status === 'failed';
+	}
+
+	// Per-run acknowledge button. stopPropagation so it doesn't also open the
+	// row/card drawer (which would acknowledge implicitly anyway).
+	function acknowledgeButton(run: Run) {
+		const pending = ackMut.isPending && ackMut.variables === run.id;
+		return (
+			<Button
+				size='small'
+				variant='outlined'
+				color='error'
+				disabled={pending}
+				startIcon={pending ? <CircularProgress size={12} /> : undefined}
+				onClick={(e) => {
+					e.stopPropagation();
+					ackMut.mutate(run.id);
+				}}
+			>
+				Acknowledge
+			</Button>
+		);
+	}
+
 	return (
 		<Box sx={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
 			<Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
@@ -152,64 +218,115 @@ export function History() {
 					</Typography>
 					{unreadCount > 0 && <Chip label={`${unreadCount} unread`} color='error' size='small' variant='outlined' />}
 				</Box>
-				{unreadCount > 0 && (
-					<Button
-						size='small'
-						variant='outlined'
-						disabled={markAllMut.isPending}
-						startIcon={markAllMut.isPending ? <CircularProgress size={12} /> : undefined}
-						onClick={() => markAllMut.mutate()}
-					>
-						Mark all read
-					</Button>
-				)}
+				<Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+					{unreadCount > 0 && (
+						<Button
+							size='small'
+							variant='outlined'
+							disabled={markAllMut.isPending}
+							startIcon={markAllMut.isPending ? <CircularProgress size={12} /> : undefined}
+							onClick={() => markAllMut.mutate()}
+						>
+							Mark all read
+						</Button>
+					)}
+					{!!runs?.length && (
+						<Button
+							size='small'
+							variant='outlined'
+							color='error'
+							disabled={clearMut.isPending}
+							startIcon={clearMut.isPending ? <CircularProgress size={12} /> : undefined}
+							onClick={() => setConfirmClear(true)}
+						>
+							Clear all
+						</Button>
+					)}
+				</Box>
 			</Box>
 
-			<TableContainer component={Paper}>
-				<Table aria-label='Run history'>
-					<TableHead>
-						<TableRow>
-							<TableCell>Job</TableCell>
-							<TableCell>Status</TableCell>
-							<TableCell>Started</TableCell>
-							<TableCell>Duration</TableCell>
-							<TableCell>Transferred</TableCell>
-							<TableCell>Alert</TableCell>
-						</TableRow>
-					</TableHead>
-					<TableBody>
-						{isLoading ? (
-							<TableRow>
-								<TableCell colSpan={6} align='center' sx={{ py: 4, color: 'text.secondary' }}>
-									Loading…
-								</TableCell>
-							</TableRow>
-						) : !runs?.length ? (
-							<TableRow>
-								<TableCell colSpan={6} align='center' sx={{ py: 4, color: 'text.secondary' }}>
-									No runs yet.
-								</TableCell>
-							</TableRow>
-						) : (
-							runs.map((run) => (
-								<TableRow key={run.id} hover sx={{ cursor: 'pointer' }} onClick={() => openDrawer(run)}>
-									<TableCell>{jobMap[run.job_id] ?? `Job #${run.job_id}`}</TableCell>
-									<TableCell>
+			{isMobile ? (
+				<Box sx={{ display: 'flex', flexDirection: 'column', gap: 1.5 }}>
+					{isLoading ? (
+						<Typography color='text.secondary' align='center' sx={{ py: 4 }}>
+							Loading…
+						</Typography>
+					) : !runs?.length ? (
+						<Typography color='text.secondary' align='center' sx={{ py: 4 }}>
+							No runs yet.
+						</Typography>
+					) : (
+						runs.map((run) => (
+							<DataCard
+								key={run.id}
+								onClick={() => openDrawer(run)}
+								title={run.job_name ?? (run.job_id != null ? (jobMap[run.job_id] ?? `Job #${run.job_id}`) : "Unknown job")}
+								actions={isUnreadFailure(run) ? acknowledgeButton(run) : undefined}
+									headerAction={
+									<Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
+										{isUnreadFailure(run) && <Chip label='unread' size='small' color='error' variant='outlined' />}
 										<Chip label={run.status} size='small' variant='outlined' color={statusColor(run.status)} />
+									</Box>
+								}
+								fields={[
+									{ label: 'Started', value: run.started_at ? new Date(run.started_at).toLocaleString() : '—' },
+									{ label: 'Duration', value: duration(run) },
+									{
+										label: 'Transferred',
+										value: `${formatBytes(run.bytes_transferred)}${run.files_transferred != null ? ` (${run.files_transferred} files)` : ''}`,
+									},
+								]}
+							/>
+						))
+					)}
+				</Box>
+			) : (
+				<TableContainer component={Paper}>
+					<Table aria-label='Run history'>
+						<TableHead>
+							<TableRow>
+								<TableCell>Job</TableCell>
+								<TableCell>Status</TableCell>
+								<TableCell>Started</TableCell>
+								<TableCell>Duration</TableCell>
+								<TableCell>Transferred</TableCell>
+								<TableCell>Alert</TableCell>
+							</TableRow>
+						</TableHead>
+						<TableBody>
+							{isLoading ? (
+								<TableRow>
+									<TableCell colSpan={6} align='center' sx={{ py: 4, color: 'text.secondary' }}>
+										Loading…
 									</TableCell>
-									<TableCell>{run.started_at ? new Date(run.started_at).toLocaleString() : '—'}</TableCell>
-									<TableCell>{duration(run)}</TableCell>
-									<TableCell>
-										{formatBytes(run.bytes_transferred)}
-										{run.files_transferred != null && ` (${run.files_transferred} files)`}
-									</TableCell>
-									<TableCell>{!run.alert_read && run.status === 'failed' && <Chip label='unread' size='small' color='error' variant='outlined' />}</TableCell>
 								</TableRow>
-							))
-						)}
-					</TableBody>
-				</Table>
-			</TableContainer>
+							) : !runs?.length ? (
+								<TableRow>
+									<TableCell colSpan={6} align='center' sx={{ py: 4, color: 'text.secondary' }}>
+										No runs yet.
+									</TableCell>
+								</TableRow>
+							) : (
+								runs.map((run) => (
+									<TableRow key={run.id} hover sx={{ cursor: 'pointer' }} onClick={() => openDrawer(run)}>
+										<TableCell>{run.job_name ?? (run.job_id != null ? (jobMap[run.job_id] ?? `Job #${run.job_id}`) : "Unknown job")}</TableCell>
+										<TableCell>
+											<Chip label={run.status} size='small' variant='outlined' color={statusColor(run.status)} />
+										</TableCell>
+										<TableCell>{run.started_at ? new Date(run.started_at).toLocaleString() : '—'}</TableCell>
+										<TableCell>{duration(run)}</TableCell>
+										<TableCell>
+											{formatBytes(run.bytes_transferred)}
+											{run.files_transferred != null && ` (${run.files_transferred} files)`}
+										</TableCell>
+										<TableCell>{isUnreadFailure(run) && acknowledgeButton(run)}</TableCell>
+									</TableRow>
+								))
+							)}
+						</TableBody>
+					</Table>
+				</TableContainer>
+			)}
 
 			<Drawer anchor='right' open={drawerOpen} onClose={() => setDrawerOpen(false)} PaperProps={{ sx: { width: { xs: '100%', sm: 520, md: 720, lg: 960, xl: 1200 } } }}>
 				<Box sx={{ p: 3, height: '100%', overflowY: 'auto' }}>
@@ -221,7 +338,7 @@ export function History() {
 							mb: 2.5,
 						}}
 					>
-						<Typography variant='h6'>{selected ? (jobMap[selected.job_id] ?? `Job #${selected.job_id}`) : 'Run details'}</Typography>
+						<Typography variant='h6'>{selected ? (selected.job_name ?? (selected.job_id != null ? (jobMap[selected.job_id] ?? `Job #${selected.job_id}`) : 'Unknown job')) : 'Run details'}</Typography>
 						<IconButton onClick={() => setDrawerOpen(false)}>
 							<CloseIcon />
 						</IconButton>
@@ -327,12 +444,21 @@ export function History() {
 								<Typography variant='subtitle2' gutterBottom>
 									Log output
 								</Typography>
-								<LogViewer log={detailLoading && !runDetail ? undefined : (runDetail?.log_output ?? '')} isLive={isLive} />
+								<LogViewer log={localLog === null ? undefined : localLog} isLive={isLive} />
 							</Box>
 						</Box>
 					)}
 				</Box>
 			</Drawer>
+
+			<ConfirmDialog
+				open={confirmClear}
+				title='Clear run history'
+				message='Permanently delete all run history? Active (running or queued) runs are kept. This cannot be undone.'
+				confirmLabel='Clear all'
+				onConfirm={() => clearMut.mutate()}
+				onClose={() => setConfirmClear(false)}
+			/>
 		</Box>
 	);
 }

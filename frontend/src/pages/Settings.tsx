@@ -10,11 +10,13 @@ import {
   DialogContent,
   DialogTitle,
   FormControl,
+  FormControlLabel,
   IconButton,
   InputLabel,
   MenuItem,
   Paper,
   Select,
+  Switch,
   Tab,
   Table,
   TableBody,
@@ -29,7 +31,9 @@ import {
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import { ConfirmDialog } from "../components/ConfirmDialog";
+import { DataCard } from "../components/DataCard";
 import { settingsApi, type ApiKeyRecord, type UserRecord } from "../lib/api";
+import { useIsMobile } from "../lib/useIsMobile";
 
 // ─── General tab ──────────────────────────────────────────────────────────────
 
@@ -81,10 +85,10 @@ function GeneralTab() {
           fullWidth
         />
         <TextField
-          label="Idle shutdown timeout (s)"
+          label="WoL max retries"
           type="number"
-          value={field("idle_shutdown_timeout")}
-          onChange={(e) => set("idle_shutdown_timeout", e.target.value)}
+          value={field("wol_max_retries")}
+          onChange={(e) => set("wol_max_retries", e.target.value)}
           size="small"
           fullWidth
         />
@@ -103,6 +107,31 @@ function GeneralTab() {
           onChange={(e) => set("cache_max_depth", e.target.value)}
           size="small"
           fullWidth
+        />
+      </Box>
+
+      <Box sx={{ display: "flex", flexDirection: "column", gap: 1.5, maxWidth: 480 }}>
+        <Typography variant="body2" fontWeight={600}>
+          Idle shutdown
+        </Typography>
+        <FormControlLabel
+          control={
+            <Switch
+              checked={field("idle_shutdown_enabled") === "true"}
+              onChange={(e) => set("idle_shutdown_enabled", e.target.checked ? "true" : "false")}
+              size="small"
+            />
+          }
+          label="Shut down node when idle"
+        />
+        <TextField
+          label="Idle timeout (minutes)"
+          type="number"
+          value={Math.round(parseInt(field("idle_shutdown_timeout") || "3600") / 60)}
+          onChange={(e) => set("idle_shutdown_timeout", String(parseInt(e.target.value || "60") * 60))}
+          size="small"
+          disabled={field("idle_shutdown_enabled") !== "true"}
+          sx={{ maxWidth: 220 }}
         />
       </Box>
 
@@ -170,6 +199,7 @@ function GeneralTab() {
 
 function UsersTab() {
   const qc = useQueryClient();
+  const isMobile = useIsMobile();
   const [isOpen, setIsOpen] = useState(false);
   const [editingUser, setEditingUser] = useState<UserRecord | null>(null);
   const [username, setUsername] = useState("");
@@ -224,78 +254,124 @@ function UsersTab() {
           Add user
         </Button>
       </Box>
-      <TableContainer component={Paper}>
-        <Table aria-label="Users">
-          <TableHead>
-            <TableRow>
-              <TableCell>Username</TableCell>
-              <TableCell>Role</TableCell>
-              <TableCell>Last login</TableCell>
-              <TableCell>Actions</TableCell>
-            </TableRow>
-          </TableHead>
-          <TableBody>
-            {isLoading ? (
-              <TableRow>
-                <TableCell
-                  colSpan={4}
-                  align="center"
-                  sx={{ py: 4, color: "text.secondary" }}
-                >
-                  Loading…
-                </TableCell>
-              </TableRow>
-            ) : !users?.length ? (
-              <TableRow>
-                <TableCell
-                  colSpan={4}
-                  align="center"
-                  sx={{ py: 4, color: "text.secondary" }}
-                >
-                  No users.
-                </TableCell>
-              </TableRow>
-            ) : (
-              users.map((u) => (
-                <TableRow key={u.id}>
-                  <TableCell>{u.username}</TableCell>
-                  <TableCell>{u.role}</TableCell>
-                  <TableCell>
-                    {u.last_login
+      {isMobile ? (
+        <Box sx={{ display: "flex", flexDirection: "column", gap: 1.5 }}>
+          {isLoading ? (
+            <Typography color="text.secondary" align="center" sx={{ py: 4 }}>
+              Loading…
+            </Typography>
+          ) : !users?.length ? (
+            <Typography color="text.secondary" align="center" sx={{ py: 4 }}>
+              No users.
+            </Typography>
+          ) : (
+            users.map((u) => (
+              <DataCard
+                key={u.id}
+                title={u.username}
+                fields={[
+                  { label: "Role", value: u.role },
+                  {
+                    label: "Last login",
+                    value: u.last_login
                       ? new Date(u.last_login).toLocaleString()
-                      : "Never"}
-                  </TableCell>
-                  <TableCell>
-                    <Box sx={{ display: "flex", gap: 1 }}>
-                      <Button
-                        size="small"
-                        variant="outlined"
-                        onClick={() => openEdit(u)}
-                      >
-                        Edit
-                      </Button>
-                      <Button
-                        size="small"
-                        variant="outlined"
-                        color="error"
-                        onClick={() => setDeleteTarget(u)}
-                      >
-                        Delete
-                      </Button>
-                    </Box>
+                      : "Never",
+                  },
+                ]}
+                actions={
+                  <>
+                    <Button size="small" variant="outlined" onClick={() => openEdit(u)}>
+                      Edit
+                    </Button>
+                    <Button
+                      size="small"
+                      variant="outlined"
+                      color="error"
+                      onClick={() => setDeleteTarget(u)}
+                    >
+                      Delete
+                    </Button>
+                  </>
+                }
+              />
+            ))
+          )}
+        </Box>
+      ) : (
+        <TableContainer component={Paper}>
+          <Table aria-label="Users">
+            <TableHead>
+              <TableRow>
+                <TableCell>Username</TableCell>
+                <TableCell>Role</TableCell>
+                <TableCell>Last login</TableCell>
+                <TableCell>Actions</TableCell>
+              </TableRow>
+            </TableHead>
+            <TableBody>
+              {isLoading ? (
+                <TableRow>
+                  <TableCell
+                    colSpan={4}
+                    align="center"
+                    sx={{ py: 4, color: "text.secondary" }}
+                  >
+                    Loading…
                   </TableCell>
                 </TableRow>
-              ))
-            )}
-          </TableBody>
-        </Table>
-      </TableContainer>
+              ) : !users?.length ? (
+                <TableRow>
+                  <TableCell
+                    colSpan={4}
+                    align="center"
+                    sx={{ py: 4, color: "text.secondary" }}
+                  >
+                    No users.
+                  </TableCell>
+                </TableRow>
+              ) : (
+                users.map((u) => (
+                  <TableRow key={u.id}>
+                    <TableCell>{u.username}</TableCell>
+                    <TableCell>{u.role}</TableCell>
+                    <TableCell>
+                      {u.last_login
+                        ? new Date(u.last_login).toLocaleString()
+                        : "Never"}
+                    </TableCell>
+                    <TableCell>
+                      <Box sx={{ display: "flex", gap: 1 }}>
+                        <Button
+                          size="small"
+                          variant="outlined"
+                          onClick={() => openEdit(u)}
+                        >
+                          Edit
+                        </Button>
+                        <Button
+                          size="small"
+                          variant="outlined"
+                          color="error"
+                          onClick={() => setDeleteTarget(u)}
+                        >
+                          Delete
+                        </Button>
+                      </Box>
+                    </TableCell>
+                  </TableRow>
+                ))
+              )}
+            </TableBody>
+          </Table>
+        </TableContainer>
+      )}
 
       <Dialog
         open={isOpen}
         onClose={() => setIsOpen(false)}
         maxWidth="xs"
         fullWidth
+        fullScreen={isMobile}
       >
         <DialogTitle sx={{ pr: 6 }}>
           {editingUser ? `Edit ${editingUser.username}` : "Add user"}
@@ -381,6 +457,7 @@ function UsersTab() {
 
 function ApiKeysTab() {
   const qc = useQueryClient();
+  const isMobile = useIsMobile();
   const [isOpen, setIsOpen] = useState(false);
   const [keyName, setKeyName] = useState("");
   const [role, setRole] = useState("viewer");
@@ -426,71 +503,118 @@ function ApiKeysTab() {
           Create key
         </Button>
       </Box>
-      <TableContainer component={Paper}>
-        <Table aria-label="API keys">
-          <TableHead>
-            <TableRow>
-              <TableCell>Name</TableCell>
-              <TableCell>Role</TableCell>
-              <TableCell>Owner</TableCell>
-              <TableCell>Last used</TableCell>
-              <TableCell>Expires</TableCell>
-              <TableCell>Actions</TableCell>
-            </TableRow>
-          </TableHead>
-          <TableBody>
-            {isLoading ? (
-              <TableRow>
-                <TableCell
-                  colSpan={6}
-                  align="center"
-                  sx={{ py: 4, color: "text.secondary" }}
-                >
-                  Loading…
-                </TableCell>
-              </TableRow>
-            ) : !(keys as ApiKeyRecord[])?.length ? (
-              <TableRow>
-                <TableCell
-                  colSpan={6}
-                  align="center"
-                  sx={{ py: 4, color: "text.secondary" }}
-                >
-                  No API keys.
-                </TableCell>
-              </TableRow>
-            ) : (
-              (keys as ApiKeyRecord[]).map((k) => (
-                <TableRow key={k.id}>
-                  <TableCell>{k.name}</TableCell>
-                  <TableCell>{k.role}</TableCell>
-                  <TableCell>{k.owner_username ?? "—"}</TableCell>
-                  <TableCell>
-                    {k.last_used_at
+      {isMobile ? (
+        <Box sx={{ display: "flex", flexDirection: "column", gap: 1.5 }}>
+          {isLoading ? (
+            <Typography color="text.secondary" align="center" sx={{ py: 4 }}>
+              Loading…
+            </Typography>
+          ) : !(keys as ApiKeyRecord[])?.length ? (
+            <Typography color="text.secondary" align="center" sx={{ py: 4 }}>
+              No API keys.
+            </Typography>
+          ) : (
+            (keys as ApiKeyRecord[]).map((k) => (
+              <DataCard
+                key={k.id}
+                title={k.name}
+                fields={[
+                  { label: "Role", value: k.role },
+                  { label: "Owner", value: k.owner_username ?? "—" },
+                  {
+                    label: "Last used",
+                    value: k.last_used_at
                       ? new Date(k.last_used_at).toLocaleString()
-                      : "Never"}
-                  </TableCell>
-                  <TableCell>
-                    {k.expires_at
+                      : "Never",
+                  },
+                  {
+                    label: "Expires",
+                    value: k.expires_at
                       ? new Date(k.expires_at).toLocaleDateString()
-                      : "Never"}
-                  </TableCell>
-                  <TableCell>
-                    <Button
-                      size="small"
-                      variant="outlined"
-                      color="error"
-                      onClick={() => setRevokeTarget(k)}
-                    >
-                      Revoke
-                    </Button>
+                      : "Never",
+                  },
+                ]}
+                actions={
+                  <Button
+                    size="small"
+                    variant="outlined"
+                    color="error"
+                    onClick={() => setRevokeTarget(k)}
+                  >
+                    Revoke
+                  </Button>
+                }
+              />
+            ))
+          )}
+        </Box>
+      ) : (
+        <TableContainer component={Paper}>
+          <Table aria-label="API keys">
+            <TableHead>
+              <TableRow>
+                <TableCell>Name</TableCell>
+                <TableCell>Role</TableCell>
+                <TableCell>Owner</TableCell>
+                <TableCell>Last used</TableCell>
+                <TableCell>Expires</TableCell>
+                <TableCell>Actions</TableCell>
+              </TableRow>
+            </TableHead>
+            <TableBody>
+              {isLoading ? (
+                <TableRow>
+                  <TableCell
+                    colSpan={6}
+                    align="center"
+                    sx={{ py: 4, color: "text.secondary" }}
+                  >
+                    Loading…
                   </TableCell>
                 </TableRow>
-              ))
-            )}
-          </TableBody>
-        </Table>
-      </TableContainer>
+              ) : !(keys as ApiKeyRecord[])?.length ? (
+                <TableRow>
+                  <TableCell
+                    colSpan={6}
+                    align="center"
+                    sx={{ py: 4, color: "text.secondary" }}
+                  >
+                    No API keys.
+                  </TableCell>
+                </TableRow>
+              ) : (
+                (keys as ApiKeyRecord[]).map((k) => (
+                  <TableRow key={k.id}>
+                    <TableCell>{k.name}</TableCell>
+                    <TableCell>{k.role}</TableCell>
+                    <TableCell>{k.owner_username ?? "—"}</TableCell>
+                    <TableCell>
+                      {k.last_used_at
+                        ? new Date(k.last_used_at).toLocaleString()
+                        : "Never"}
+                    </TableCell>
+                    <TableCell>
+                      {k.expires_at
+                        ? new Date(k.expires_at).toLocaleDateString()
+                        : "Never"}
+                    </TableCell>
+                    <TableCell>
+                      <Button
+                        size="small"
+                        variant="outlined"
+                        color="error"
+                        onClick={() => setRevokeTarget(k)}
+                      >
+                        Revoke
+                      </Button>
+                    </TableCell>
+                  </TableRow>
+                ))
+              )}
+            </TableBody>
+          </Table>
+        </TableContainer>
+      )}
 
       <Dialog
         open={isOpen}
@@ -500,6 +624,7 @@ function ApiKeysTab() {
         }}
         maxWidth="xs"
         fullWidth
+        fullScreen={isMobile}
       >
         <DialogTitle sx={{ pr: 6 }}>
           Create API key

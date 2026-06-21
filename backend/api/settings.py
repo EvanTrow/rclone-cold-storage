@@ -16,7 +16,8 @@ from backend.models import ApiKey, User
 router = APIRouter(prefix="/api/settings", tags=["settings"])
 
 EDITABLE_KEYS = {
-    "wol_broadcast", "ssh_port", "idle_shutdown_timeout",
+    "wol_broadcast", "wol_max_retries", "ssh_port",
+    "idle_shutdown_enabled", "idle_shutdown_timeout",
     "session_expiry_days", "cache_max_depth", "notification_webhook",
     "agent_callback_port",
 }
@@ -76,8 +77,8 @@ def _user_dict(u: User) -> dict:
         "id": u.id,
         "username": u.username,
         "role": u.role,
-        "created_at": u.created_at.isoformat() if u.created_at else None,
-        "last_login": u.last_login.isoformat() if u.last_login else None,
+        "created_at": u.created_at.isoformat() + "Z" if u.created_at else None,
+        "last_login": u.last_login.isoformat() + "Z" if u.last_login else None,
     }
 
 
@@ -183,9 +184,9 @@ def _key_dict(k: ApiKey, owner_username: Optional[str] = None) -> dict:
         "name": k.name,
         "role": k.role,
         "user_id": k.user_id,
-        "created_at": k.created_at.isoformat() if k.created_at else None,
-        "last_used_at": k.last_used_at.isoformat() if k.last_used_at else None,
-        "expires_at": k.expires_at.isoformat() if k.expires_at else None,
+        "created_at": k.created_at.isoformat() + "Z" if k.created_at else None,
+        "last_used_at": k.last_used_at.isoformat() + "Z" if k.last_used_at else None,
+        "expires_at": k.expires_at.isoformat() + "Z" if k.expires_at else None,
     }
     if owner_username is not None:
         d["owner_username"] = owner_username

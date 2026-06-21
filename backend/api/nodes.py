@@ -5,6 +5,7 @@ from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from backend.core import events
 from backend.core.config import get_setting
 from backend.core.deps import get_current_user, require_admin
 from backend.core.rclone_runner import speed_test
@@ -30,8 +31,8 @@ def _node_dict(n: Node) -> dict:
         "sftp_root": n.sftp_root,
         "allow_shutdown": n.allow_shutdown,
         "status": n.status,
-        "last_seen": n.last_seen.isoformat() if n.last_seen else None,
-        "last_cache_refresh": n.last_cache_refresh.isoformat() if n.last_cache_refresh else None,
+        "last_seen": n.last_seen.isoformat() + "Z" if n.last_seen else None,
+        "last_cache_refresh": n.last_cache_refresh.isoformat() + "Z" if n.last_cache_refresh else None,
     }
 
 
@@ -84,6 +85,7 @@ async def create_node(
         await db.commit()
         await db.refresh(node)
 
+    events.publish_nodes()
     return _node_dict(node)
 
 
@@ -118,6 +120,7 @@ async def update_node(
 
     await db.commit()
     await db.refresh(node)
+    events.publish_nodes()
     return _node_dict(node)
 
 
@@ -133,6 +136,7 @@ async def delete_node(
     delete_key(node_id)
     await db.delete(node)
     await db.commit()
+    events.publish_nodes()
     return {"message": "Node deleted"}
 
 
@@ -200,6 +204,7 @@ async def shutdown_node_endpoint(
     await shutdown_node(node.ip, node.ssh_user, node.ssh_key_path, node.ssh_port)
     node.status = "offline"
     await db.commit()
+    events.publish_nodes()
 
 
 @router.post("/{node_id}/wake", status_code=204)

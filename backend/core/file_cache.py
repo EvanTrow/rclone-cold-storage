@@ -10,7 +10,7 @@ from backend.core.ssh_client import _connect_kwargs
 from backend.models import Node, NodeFileCache
 
 
-async def crawl_node_sftp(node: Node, db: AsyncSession, max_depth: int = 5) -> int:
+async def crawl_node_sftp(node: Node, db: AsyncSession, max_depth: int = 5) -> dict:
     connect_kwargs = _connect_kwargs(node.ip, node.ssh_user, node.ssh_key_path, node.ssh_port)
     async with asyncssh.connect(**connect_kwargs) as conn:
         async with conn.start_sftp_client() as sftp:
@@ -24,7 +24,9 @@ async def crawl_node_sftp(node: Node, db: AsyncSession, max_depth: int = 5) -> i
 
             node.last_cache_refresh = datetime.utcnow()
             await db.commit()
-            return len(entries)
+            files = sum(1 for e in entries if e.type == "file")
+            dirs = sum(1 for e in entries if e.type == "dir")
+            return {"files": files, "dirs": dirs}
 
 
 async def _walk(

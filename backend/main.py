@@ -13,6 +13,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from backend.api import auth, files, health, nodes
+from backend.api import events as events_router
 from backend.api import jobs as jobs_router
 from backend.api import runs
 from backend.api import settings as settings_router
@@ -44,6 +45,19 @@ async def lifespan(app: FastAPI):
     stop_scheduler()
 
 
+async def _start_node_agent() -> None:
+    from backend.agent.idle_monitor import monitor_idle
+    from backend.core.config import get_setting
+    from backend.db.session import AsyncSessionLocal
+
+    async with AsyncSessionLocal() as db:
+        enabled = (await get_setting(db, "idle_shutdown_enabled") or "false").lower() == "true"
+        timeout = int(await get_setting(db, "idle_shutdown_timeout") or 3600)
+
+    if enabled:
+        asyncio.create_task(monitor_idle(timeout))
+
+
 async def _load_scheduled_jobs() -> None:
     from sqlalchemy import select
 
@@ -58,19 +72,6 @@ async def _load_scheduled_jobs() -> None:
         )
         for job in result.scalars():
             schedule_job(job.id, job.schedule_cron, execute_job, job.id)
-
-
-async def _start_node_agent() -> None:
-    import asyncio
-
-    from backend.agent.idle_monitor import monitor_idle
-    from backend.db.session import AsyncSessionLocal
-    from backend.core.config import get_setting
-
-    async with AsyncSessionLocal() as db:
-        timeout = int(await get_setting(db, "idle_shutdown_timeout") or 3600)
-
-    asyncio.create_task(monitor_idle(timeout))
 
 
 app = FastAPI(title="rclone-cold-storage", version="0.1.0", lifespan=lifespan)
@@ -106,6 +107,7 @@ app.include_router(files.router)
 app.include_router(jobs_router.router)
 app.include_router(runs.router)
 app.include_router(settings_router.router)
+app.include_router(events_router.router)
 
 # Serve built frontend (production only)
 DIST = Path(__file__).parent.parent / "frontend" / "dist"

@@ -1,16 +1,19 @@
 import asyncio
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.core.config import get_setting
 from backend.core.deps import get_current_user, require_admin
 from backend.core.file_cache import crawl_node_sftp
-from backend.db.session import get_db
+from backend.db.session import AsyncSessionLocal, get_db
 from backend.models import Node, NodeFileCache, User
 
 router = APIRouter(prefix="/api/nodes", tags=["files"])
+
+# node_id → in-flight asyncio.Task for that node's crawl
+_refresh_tasks: dict[int, asyncio.Task] = {}
 
 
 @router.get("/{node_id}/files")
@@ -34,7 +37,7 @@ async def get_file_cache(
             "name": e.name,
             "type": e.type,
             "size_bytes": e.size_bytes,
-            "modified_at": e.modified_at.isoformat() if e.modified_at else None,
+            "modified_at": e.modified_at.isoformat() + "Z" if e.modified_at else None,
         }
         for e in result.scalars()
     ]
@@ -43,7 +46,6 @@ async def get_file_cache(
 @router.post("/{node_id}/files/refresh")
 async def refresh_file_cache(
     node_id: int,
-    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
     _: User = Depends(require_admin),
 ):
@@ -51,12 +53,29 @@ async def refresh_file_cache(
     if not node:
         raise HTTPException(404, "Node not found")
 
-    async def _crawl():
-        from backend.db.session import AsyncSessionLocal
+    # Cancel any in-flight refresh for this node before starting a new one.
+    existing = _refresh_tasks.pop(node_id, None)
+    if existing and not existing.done():
+        existing.cancel()
+        try:
+            await existing
+        except (asyncio.CancelledError, Exception):
+            pass
+
+    max_depth = int(await get_setting(db, "cache_max_depth") or 5)
+
+    async def _do_crawl() -> dict:
         async with AsyncSessionLocal() as fresh_db:
             fresh_node = await fresh_db.get(Node, node_id)
-            max_depth = int(await get_setting(fresh_db, "cache_max_depth") or 5)
-            await crawl_node_sftp(fresh_node, fresh_db, max_depth)
+            return await crawl_node_sftp(fresh_node, fresh_db, max_depth)
 
-    background_tasks.add_task(_crawl)
-    return {"message": "Cache refresh started"}
+    task: asyncio.Task = asyncio.ensure_future(_do_crawl())
+    _refresh_tasks[node_id] = task
+    try:
+        counts = await task
+    except asyncio.CancelledError:
+        raise HTTPException(409, "Refresh was superseded by a newer request for this node")
+    finally:
+        _refresh_tasks.pop(node_id, None)
+
+    return {"files": counts["files"], "dirs": counts["dirs"]}

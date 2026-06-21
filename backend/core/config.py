@@ -7,7 +7,9 @@ from backend.models import Setting
 
 DEFAULTS: dict[str, str] = {
     "wol_broadcast": "255.255.255.255",
+    "wol_max_retries": "30",
     "ssh_port": "22",
+    "idle_shutdown_enabled": "false",
     "idle_shutdown_timeout": "3600",
     "session_expiry_days": "30",
     "cache_max_depth": "5",

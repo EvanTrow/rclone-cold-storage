@@ -6,7 +6,7 @@ from typing import Callable
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from backend.core import rclone_runner, ssh_client, wol
+from backend.core import events, rclone_runner, ssh_client, wol
 from backend.core.config import get_setting
 from backend.db.session import AsyncSessionLocal
 from backend.models import Job, Node, NodeLock, Run
@@ -61,10 +61,14 @@ async def execute_job(job_id: int) -> None:
         if not job or not job.enabled:
             return
 
-        run = Run(job_id=job_id, status="running", started_at=datetime.utcnow())
+        run = Run(job_id=job_id, job_name=job.name, status="running", started_at=datetime.utcnow())
         db.add(run)
         await db.commit()
         await db.refresh(run)
+
+        # Announce the new run so the History list / Dashboard pick it up live.
+        events.publish_runs()
+        events.publish_run(run.id)
 
         task = asyncio.current_task()
         if task:
@@ -81,6 +85,8 @@ async def execute_job(job_id: int) -> None:
             run.log_output = "\n".join(log_lines)
             _flushed_at[0] = len(log_lines)
             await db.commit()
+            # Push the new log output to anyone watching this run's detail view.
+            events.publish_run(run.id)
 
         async def on_rclone_line(line: str) -> None:
             log_lines.append(line)
@@ -105,6 +111,9 @@ async def execute_job(job_id: int) -> None:
             run.log_output = "\n".join(log_lines)
             await _release_lock(db, run.id)
             await db.commit()
+            # Final state — refresh the list and the detail view.
+            events.publish_runs()
+            events.publish_run(run.id)
             if run.status == "failed":
                 await _notify_failure(db, job, run, log_lines[-1] if log_lines else "unknown error")
 
@@ -126,6 +135,7 @@ async def _run_job(
             log("Waiting for node lock…")
             run.status = "queued"
             await flush_log()
+            events.publish_runs()
             for _ in range(60):
                 await asyncio.sleep(10)
                 if await _acquire_lock(db, primary_node_id, run.id):
@@ -134,8 +144,10 @@ async def _run_job(
                 raise RuntimeError("Timed out waiting for node lock")
             run.status = "running"
             await flush_log()
+            events.publish_runs()
 
     wol_broadcast = await get_setting(db, "wol_broadcast") or "255.255.255.255"
+    wol_max_retries = int(await get_setting(db, "wol_max_retries") or 30)
 
     for node_id in node_ids:
         node = await db.get(Node, node_id)
@@ -149,10 +161,12 @@ async def _run_job(
             log(f"Sending WOL to {node.name} ({node.mac})")
             node.status = "waking"
             await flush_log()
+            events.publish_nodes()
             await wol.send_wol(node.mac, wol_broadcast)
             log(f"Waiting for {node.name} to come online…")
             reachable = await ssh_client.poll_until_reachable(
-                node.ip, node.ssh_user, node.ssh_key_path, node.ssh_port
+                node.ip, node.ssh_user, node.ssh_key_path, node.ssh_port,
+                max_retries=wol_max_retries,
             )
             if not reachable:
                 raise RuntimeError(f"{node.name} did not wake within timeout")
@@ -163,6 +177,7 @@ async def _run_job(
         node.status = "online"
         node.last_seen = datetime.utcnow()
         await flush_log()
+        events.publish_nodes()
 
     if job.operation == "copy":
         await _do_copy(db, job, run, log, flush_log, on_rclone_line)
@@ -215,9 +230,17 @@ async def _run_job(
                         )
                         dst_node.status = "offline"
                         await db.commit()
+                        events.publish_nodes()
                     except Exception as exc:
                         log(f"Shutdown failed for {dst_node.name}: {exc}")
                         await flush_log()
+
+    if job.delete_on_success and run.status == "success":
+        log(f"Deleting job '{job.name}' on success…")
+        await flush_log()
+        await db.delete(job)
+        await db.commit()
+        events.publish_jobs()
 
     run.finished_at = datetime.utcnow()
 

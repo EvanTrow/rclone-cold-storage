@@ -3,7 +3,7 @@ import os
 import time
 
 
-async def monitor_idle(idle_timeout_secs: int = 3600) -> None:
+async def monitor_idle(idle_timeout_secs: int) -> None:
     """Shuts down the node after idle_timeout_secs of no active SSH/SFTP connections."""
     last_active = time.monotonic()
     while True:

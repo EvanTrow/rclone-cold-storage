@@ -5,6 +5,7 @@ from datetime import datetime
 
 from sqlalchemy import select
 
+from backend.core import events
 from backend.core.ssh_client import test_ssh_connection
 from backend.db.session import AsyncSessionLocal
 from backend.models import Node
@@ -30,15 +31,26 @@ async def refresh_node_statuses() -> None:
 
     results = await asyncio.gather(*[_check(n) for n in nodes], return_exceptions=True)
 
+    changed = False
     async with AsyncSessionLocal() as db:
-        for item in results:
-            if isinstance(item, Exception):
-                logger.warning("Node status check error: %s", item)
-                continue
-            node_id, status = item
-            node = await db.get(Node, node_id)
-            if node and node.status != "waking":
-                node.status = status
-                if status == "online":
-                    node.last_seen = datetime.utcnow()
+        # no_autoflush prevents SQLAlchemy from flushing dirty objects mid-loop
+        # when db.get() is called on subsequent iterations.
+        async with db.no_autoflush:
+            for item in results:
+                if isinstance(item, Exception):
+                    logger.warning("Node status check error: %s", item)
+                    continue
+                node_id, status = item
+                node = await db.get(Node, node_id)
+                if node and node.status != "waking":
+                    if node.status != status:
+                        changed = True
+                    node.status = status
+                    if status == "online":
+                        node.last_seen = datetime.utcnow()
         await db.commit()
+
+    # Only push when something actually flipped so idle clients aren't told to
+    # refetch every cycle.
+    if changed:
+        events.publish_nodes()

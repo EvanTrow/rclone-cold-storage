@@ -25,7 +25,9 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useSnackbar } from "notistack";
 import { useRef, useState } from "react";
 import { ConfirmDialog } from "../components/ConfirmDialog";
+import { DataCard } from "../components/DataCard";
 import { nodesApi, type Node, type NodeCreate, type SpeedTest } from "../lib/api";
+import { useIsMobile } from "../lib/useIsMobile";
 import {
   isAbsolutePath,
   isBlank,
@@ -94,6 +96,7 @@ const EMPTY: NodeCreate = {
 
 export function Nodes() {
   const qc = useQueryClient();
+  const isMobile = useIsMobile();
   const [isOpen, setIsOpen] = useState(false);
   const [editing, setEditing] = useState<Node | null>(null);
   const [form, setForm] = useState<NodeCreate>(EMPTY);
@@ -136,7 +139,7 @@ export function Nodes() {
     onSuccess: () => qc.invalidateQueries({ queryKey: ["nodes"] }),
   });
 
-  const refreshMut = useMutation({ mutationFn: nodesApi.refreshFiles });
+  const [refreshing, setRefreshing] = useState<Set<number>>(new Set());
   const wakeMut = useMutation({
     mutationFn: nodesApi.wake,
     onSuccess: () => qc.invalidateQueries({ queryKey: ["nodes"] }),
@@ -225,6 +228,30 @@ export function Nodes() {
     }
   }
 
+  async function refreshCache(node: Node) {
+    setRefreshing((prev) => new Set(prev).add(node.id));
+    try {
+      const res = await nodesApi.refreshFiles(node.id);
+      qc.invalidateQueries({ queryKey: ["nodes"] });
+      const d = res.dirs, f = res.files;
+      enqueueSnackbar(
+        `${node.name}: cached ${d} folder${d === 1 ? "" : "s"} and ${f} file${f === 1 ? "" : "s"}`,
+        { variant: "success" },
+      );
+    } catch (e) {
+      enqueueSnackbar(
+        `${node.name}: ${e instanceof Error ? e.message : "Cache refresh failed"}`,
+        { variant: "error", autoHideDuration: 12000 },
+      );
+    } finally {
+      setRefreshing((prev) => {
+        const next = new Set(prev);
+        next.delete(node.id);
+        return next;
+      });
+    }
+  }
+
   function field<K extends keyof NodeCreate>(key: K) {
     return String(form[key] ?? "");
   }
@@ -239,6 +266,113 @@ export function Nodes() {
   const hasErrors = Object.keys(errors).length > 0;
   const showError = (k: keyof NodeCreate) => (attempted ? errors[k] : undefined);
 
+  // Shared between the desktop table row and the mobile card.
+  function statusChip(node: Node) {
+    return (
+      <Chip
+        label={node.status}
+        size="small"
+        variant="outlined"
+        color={
+          node.status === "online"
+            ? "success"
+            : node.status === "waking"
+              ? "warning"
+              : node.status === "offline"
+                ? "error"
+                : "default"
+        }
+      />
+    );
+  }
+
+  function nodeActions(node: Node) {
+    const isOnline = node.status === "online";
+    return (
+      <>
+        <Button size="small" variant="outlined" onClick={() => openEdit(node)}>
+          Edit
+        </Button>
+        <Button size="small" variant="outlined" onClick={() => testConn(node)}>
+          {!testResult[node.id]
+            ? "Test"
+            : testResult[node.id].ok === null
+              ? "Testing…"
+              : testResult[node.id].ok
+                ? "✓ Online"
+                : "✗ Failed"}
+        </Button>
+        {isOnline ? (
+          <Button
+            size="small"
+            variant="outlined"
+            color="warning"
+            disabled={(shutdownMut.isPending && shutdownMut.variables === node.id) || node.allow_shutdown === false}
+            startIcon={
+              shutdownMut.isPending && shutdownMut.variables === node.id ? (
+                <CircularProgress size={12} />
+              ) : undefined
+            }
+            onClick={() => setShutdownTarget(node)}
+          >
+            Shutdown
+          </Button>
+        ) : (
+          <Button
+            size="small"
+            variant="outlined"
+            disabled={wakeMut.isPending && wakeMut.variables === node.id}
+            startIcon={
+              wakeMut.isPending && wakeMut.variables === node.id ? (
+                <CircularProgress size={12} />
+              ) : undefined
+            }
+            onClick={() => wakeMut.mutate(node.id)}
+          >
+            Wake
+          </Button>
+        )}
+        <Button
+          size="small"
+          variant="outlined"
+          disabled={refreshing.has(node.id)}
+          startIcon={
+            refreshing.has(node.id) ? <CircularProgress size={12} /> : undefined
+          }
+          onClick={() => refreshCache(node)}
+        >
+          {refreshing.has(node.id) ? "Refreshing…" : "Refresh cache"}
+        </Button>
+        <Button
+          size="small"
+          variant="outlined"
+          color="error"
+          onClick={() => setDeleteTarget(node)}
+        >
+          Delete
+        </Button>
+      </>
+    );
+  }
+
+  function nodeTitle(node: Node) {
+    return (
+      <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
+        {node.name}
+        {node.has_ssh_key && (
+          <Typography
+            component="span"
+            variant="caption"
+            color="text.secondary"
+            title="SSH key on file"
+          >
+            🔑
+          </Typography>
+        )}
+      </Box>
+    );
+  }
+
   return (
     <Box sx={{ display: "flex", flexDirection: "column", gap: 3 }}>
       <Box sx={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
@@ -250,71 +384,79 @@ export function Nodes() {
         </Button>
       </Box>
 
-      <TableContainer component={Paper}>
-        <Table aria-label="Nodes">
-          <TableHead>
-            <TableRow>
-              <TableCell>Name</TableCell>
-              <TableCell>IP</TableCell>
-              <TableCell>MAC</TableCell>
-              <TableCell>Status</TableCell>
-              <TableCell>Cache refreshed</TableCell>
-              <TableCell>Actions</TableCell>
-            </TableRow>
-          </TableHead>
-          <TableBody>
-            {isLoading ? (
+      {isMobile ? (
+        <Box sx={{ display: "flex", flexDirection: "column", gap: 1.5 }}>
+          {isLoading ? (
+            <Typography color="text.secondary" align="center" sx={{ py: 4 }}>
+              Loading…
+            </Typography>
+          ) : !nodes?.length ? (
+            <Typography color="text.secondary" align="center" sx={{ py: 4 }}>
+              No nodes configured yet.
+            </Typography>
+          ) : (
+            nodes.map((node) => (
+              <DataCard
+                key={node.id}
+                title={nodeTitle(node)}
+                headerAction={statusChip(node)}
+                fields={[
+                  { label: "IP", value: node.ip },
+                  {
+                    label: "MAC",
+                    value: (
+                      <Typography variant="body2" sx={{ fontFamily: "monospace" }}>
+                        {node.mac}
+                      </Typography>
+                    ),
+                  },
+                  {
+                    label: "Cache refreshed",
+                    value: node.last_cache_refresh
+                      ? new Date(node.last_cache_refresh).toLocaleString()
+                      : "Never",
+                  },
+                ]}
+                actions={nodeActions(node)}
+              />
+            ))
+          )}
+        </Box>
+      ) : (
+        <TableContainer component={Paper}>
+          <Table aria-label="Nodes">
+            <TableHead>
               <TableRow>
-                <TableCell colSpan={6} align="center" sx={{ py: 4, color: "text.secondary" }}>
-                  Loading…
-                </TableCell>
+                <TableCell>Name</TableCell>
+                <TableCell>IP</TableCell>
+                <TableCell>MAC</TableCell>
+                <TableCell>Status</TableCell>
+                <TableCell>Cache refreshed</TableCell>
+                <TableCell>Actions</TableCell>
               </TableRow>
-            ) : !nodes?.length ? (
-              <TableRow>
-                <TableCell colSpan={6} align="center" sx={{ py: 4, color: "text.secondary" }}>
-                  No nodes configured yet.
-                </TableCell>
-              </TableRow>
-            ) : (
-              nodes.map((node) => {
-                const isOnline = node.status === "online";
-                return (
+            </TableHead>
+            <TableBody>
+              {isLoading ? (
+                <TableRow>
+                  <TableCell colSpan={6} align="center" sx={{ py: 4, color: "text.secondary" }}>
+                    Loading…
+                  </TableCell>
+                </TableRow>
+              ) : !nodes?.length ? (
+                <TableRow>
+                  <TableCell colSpan={6} align="center" sx={{ py: 4, color: "text.secondary" }}>
+                    No nodes configured yet.
+                  </TableCell>
+                </TableRow>
+              ) : (
+                nodes.map((node) => (
                   <TableRow key={node.id}>
-                    <TableCell>
-                      <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
-                        {node.name}
-                        {node.has_ssh_key && (
-                          <Typography
-                            component="span"
-                            variant="caption"
-                            color="text.secondary"
-                            title="SSH key on file"
-                          >
-                            🔑
-                          </Typography>
-                        )}
-                      </Box>
-                    </TableCell>
+                    <TableCell>{nodeTitle(node)}</TableCell>
                     <TableCell>{node.ip}</TableCell>
                     <TableCell sx={{ fontFamily: "monospace", fontSize: "0.8125rem" }}>
                       {node.mac}
                     </TableCell>
-                    <TableCell>
-                      <Chip
-                        label={node.status}
-                        size="small"
-                        variant="outlined"
-                        color={
-                          node.status === "online"
-                            ? "success"
-                            : node.status === "waking"
-                              ? "warning"
-                              : node.status === "offline"
-                                ? "error"
-                                : "default"
-                        }
-                      />
-                    </TableCell>
+                    <TableCell>{statusChip(node)}</TableCell>
                     <TableCell>
                       {node.last_cache_refresh
                         ? new Date(node.last_cache_refresh).toLocaleString()
@@ -322,86 +464,16 @@ export function Nodes() {
                     </TableCell>
                     <TableCell>
                       <Box sx={{ display: "flex", gap: 1, flexWrap: "wrap" }}>
-                        <Button
-                          size="small"
-                          variant="outlined"
-                          onClick={() => openEdit(node)}
-                        >
-                          Edit
-                        </Button>
-                        <Button
-                          size="small"
-                          variant="outlined"
-                          onClick={() => testConn(node)}
-                        >
-                          {!testResult[node.id]
-                            ? "Test"
-                            : testResult[node.id].ok === null
-                              ? "Testing…"
-                              : testResult[node.id].ok
-                                ? "✓ Online"
-                                : "✗ Failed"}
-                        </Button>
-                        {isOnline ? (
-                          <Button
-                            size="small"
-                            variant="outlined"
-                            color="warning"
-                            disabled={(shutdownMut.isPending && shutdownMut.variables === node.id) || node.allow_shutdown === false}
-                            startIcon={
-                              shutdownMut.isPending && shutdownMut.variables === node.id ? (
-                                <CircularProgress size={12} />
-                              ) : undefined
-                            }
-                            onClick={() => setShutdownTarget(node)}
-                          >
-                            Shutdown
-                          </Button>
-                        ) : (
-                          <Button
-                            size="small"
-                            variant="outlined"
-                            disabled={wakeMut.isPending && wakeMut.variables === node.id}
-                            startIcon={
-                              wakeMut.isPending && wakeMut.variables === node.id ? (
-                                <CircularProgress size={12} />
-                              ) : undefined
-                            }
-                            onClick={() => wakeMut.mutate(node.id)}
-                          >
-                            Wake
-                          </Button>
-                        )}
-                        <Button
-                          size="small"
-                          variant="outlined"
-                          disabled={refreshMut.isPending}
-                          startIcon={
-                            refreshMut.isPending ? (
-                              <CircularProgress size={12} />
-                            ) : undefined
-                          }
-                          onClick={() => refreshMut.mutate(node.id)}
-                        >
-                          Refresh cache
-                        </Button>
-                        <Button
-                          size="small"
-                          variant="outlined"
-                          color="error"
-                          onClick={() => setDeleteTarget(node)}
-                        >
-                          Delete
-                        </Button>
+                        {nodeActions(node)}
                       </Box>
                     </TableCell>
                   </TableRow>
-                );
-              })
-            )}
-          </TableBody>
-        </Table>
-      </TableContainer>
+                ))
+              )}
+            </TableBody>
+          </Table>
+        </TableContainer>
+      )}
 
       {/* Edit / Create dialog */}
       <Dialog
@@ -409,6 +481,7 @@ export function Nodes() {
         onClose={() => setIsOpen(false)}
         maxWidth="sm"
         fullWidth
+        fullScreen={isMobile}
       >
         <DialogTitle sx={{ pr: 6 }}>
           {editing ? "Edit node" : "Add node"}
@@ -423,7 +496,7 @@ export function Nodes() {
           <Box
             sx={{
               display: "grid",
-              gridTemplateColumns: "1fr 1fr",
+              gridTemplateColumns: { xs: "1fr", sm: "1fr 1fr" },
               gap: 2,
               pt: 0.5,
             }}

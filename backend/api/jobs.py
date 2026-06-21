@@ -6,6 +6,7 @@ from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from backend.core import events
 from backend.core.deps import get_current_user, require_admin
 from backend.core.job_runner import execute_job
 from backend.core.scheduler import schedule_job, unschedule_job
@@ -28,6 +29,7 @@ def _job_dict(j: Job) -> dict:
         "schedule_cron": j.schedule_cron,
         "shutdown_after": j.shutdown_after,
         "enabled": j.enabled,
+        "delete_on_success": j.delete_on_success,
     }
 
 
@@ -42,6 +44,7 @@ class JobCreate(BaseModel):
     schedule_cron: Optional[str] = None
     shutdown_after: bool = False
     enabled: bool = True
+    delete_on_success: bool = False
     run_now: bool = False
 
 
@@ -56,6 +59,7 @@ class JobUpdate(BaseModel):
     schedule_cron: Optional[str] = None
     shutdown_after: Optional[bool] = None
     enabled: Optional[bool] = None
+    delete_on_success: Optional[bool] = None
 
 
 def _sync_schedule(job: Job) -> None:
@@ -87,6 +91,7 @@ async def create_job(
     await db.commit()
     await db.refresh(job)
     _sync_schedule(job)
+    events.publish_jobs()
     if body.run_now:
         background_tasks.add_task(execute_job, job.id)
     return _job_dict(job)
@@ -119,6 +124,7 @@ async def update_job(
     await db.commit()
     await db.refresh(job)
     _sync_schedule(job)
+    events.publish_jobs()
     return _job_dict(job)
 
 
@@ -134,6 +140,7 @@ async def delete_job(
     unschedule_job(job_id)
     await db.delete(job)
     await db.commit()
+    events.publish_jobs()
     return {"message": "Job deleted"}
 
 

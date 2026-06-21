@@ -30,8 +30,10 @@ import {
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import { ConfirmDialog } from "../components/ConfirmDialog";
+import { DataCard } from "../components/DataCard";
 import { FileBrowser } from "../components/FileBrowser";
 import { jobsApi, nodesApi, type Job, type JobCreate } from "../lib/api";
+import { useIsMobile } from "../lib/useIsMobile";
 import { isBlank, isValidCron } from "../lib/validation";
 
 function jobErrors(f: JobCreate): Record<string, string> {
@@ -64,6 +66,7 @@ const EMPTY_FORM: JobCreate = {
   schedule_cron: "",
   shutdown_after: false,
   enabled: true,
+  delete_on_success: false,
   run_now: false,
 };
 
@@ -87,8 +90,10 @@ function opLabel(op: Job["operation"]): string {
 
 // Paths carry a trailing slash for directories; use that to report how many
 // files and folders an operation will touch.
-function describeItems(paths: string[] | null | undefined): string {
+function describeItems(paths: string[] | null | undefined, sftpRoot?: string | null): string {
   const list = paths ?? [];
+  const root = sftpRoot?.replace(/\/$/, "") ?? "";
+  if (list.length === 1 && root && list[0].replace(/\/$/, "") === root) return "the entire node";
   const folders = list.filter((p) => p.endsWith("/")).length;
   const files = list.length - folders;
   const parts: string[] = [];
@@ -99,6 +104,7 @@ function describeItems(paths: string[] | null | undefined): string {
 
 export function Jobs() {
   const qc = useQueryClient();
+  const isMobile = useIsMobile();
   const [isOpen, setIsOpen] = useState(false);
   const [editing, setEditing] = useState<Job | null>(null);
   const [form, setForm] = useState<JobCreate>(EMPTY_FORM);
@@ -162,6 +168,7 @@ export function Jobs() {
       schedule_cron: job.schedule_cron ?? "",
       shutdown_after: job.shutdown_after,
       enabled: job.enabled,
+      delete_on_success: job.delete_on_success,
       run_now: false,
     });
     setAttempted(false);
@@ -208,17 +215,18 @@ export function Jobs() {
   function describeRun(job: Job): string {
     const src = nodeName(job.source_node_id);
     const dst = nodeName(job.dest_node_id);
+    const srcRoot = nodes?.find((n) => n.id === job.source_node_id)?.sftp_root;
+    const nodeForDelete = job.source_node_id ?? job.dest_node_id;
+    const nodeRootForDelete = nodes?.find((n) => n.id === nodeForDelete)?.sftp_root;
     switch (job.operation) {
       case "copy":
-        return `This will copy ${describeItems(job.source_paths)} from "${src}" to "${dst}" at ${job.dest_path || "the destination root"}. Existing files on the destination are left in place.`;
+        return `This will copy ${describeItems(job.source_paths, srcRoot)} from "${src}" to "${dst}" at ${job.dest_path || "the destination root"}. Existing files on the destination are left in place.`;
       case "move":
-        return `This will move ${describeItems(job.source_paths)} from "${src}" to "${dst}" at ${job.dest_path || "the destination root"}. Each item is copied, verified by checksum, then deleted from the source.`;
+        return `This will move ${describeItems(job.source_paths, srcRoot)} from "${src}" to "${dst}" at ${job.dest_path || "the destination root"}. Each item is copied, verified by checksum, then deleted from the source.`;
       case "sync":
-        return `This will sync ${describeItems(job.source_paths)} from "${src}" to "${dst}", making the destination identical to the source. Files on the destination that are not in the source will be permanently deleted.`;
-      case "delete": {
-        const node = nodeName(job.source_node_id ?? job.dest_node_id);
-        return `This will permanently delete ${describeItems(job.target_paths)} from "${node}". This cannot be undone.`;
-      }
+        return `This will sync ${describeItems(job.source_paths, srcRoot)} from "${src}" to "${dst}", making the destination identical to the source. Files on the destination that are not in the source will be permanently deleted.`;
+      case "delete":
+        return `This will permanently delete ${describeItems(job.target_paths, nodeRootForDelete)} from "${nodeName(nodeForDelete)}". This cannot be undone.`;
     }
   }
 
@@ -281,6 +289,46 @@ export function Jobs() {
     return sev === "info" ? "primary" : sev;
   }
 
+  // Shared between the desktop table row and the mobile card so the actions
+  // stay identical across layouts.
+  function enabledSwitch(job: Job) {
+    return (
+      <Switch
+        checked={job.enabled}
+        size="small"
+        onChange={(e) => toggleMut.mutate({ id: job.id, enabled: e.target.checked })}
+      />
+    );
+  }
+
+  function jobActions(job: Job) {
+    const running = triggerMut.isPending && triggerMut.variables === job.id;
+    return (
+      <>
+        <Button size="small" variant="outlined" onClick={() => openEdit(job)}>
+          Edit
+        </Button>
+        <Button
+          size="small"
+          variant="outlined"
+          disabled={running}
+          startIcon={running ? <CircularProgress size={12} /> : undefined}
+          onClick={() => setRunTarget(job)}
+        >
+          {`Run ${opLabel(job.operation)}`}
+        </Button>
+        <Button
+          size="small"
+          variant="outlined"
+          color="error"
+          onClick={() => setDeleteTarget(job)}
+        >
+          Delete
+        </Button>
+      </>
+    );
+  }
+
   return (
     <Box sx={{ display: "flex", flexDirection: "column", gap: 3 }}>
       <Box sx={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
@@ -292,107 +340,111 @@ export function Jobs() {
         </Button>
       </Box>
 
-      <TableContainer component={Paper}>
-        <Table aria-label="Jobs">
-          <TableHead>
-            <TableRow>
-              <TableCell>Name</TableCell>
-              <TableCell>Operation</TableCell>
-              <TableCell>Schedule</TableCell>
-              <TableCell>Enabled</TableCell>
-              <TableCell>Actions</TableCell>
-            </TableRow>
-          </TableHead>
-          <TableBody>
-            {isLoading ? (
+      {isMobile ? (
+        <Box sx={{ display: "flex", flexDirection: "column", gap: 1.5 }}>
+          {isLoading ? (
+            <Typography color="text.secondary" align="center" sx={{ py: 4 }}>
+              Loading…
+            </Typography>
+          ) : !jobs?.length ? (
+            <Typography color="text.secondary" align="center" sx={{ py: 4 }}>
+              No jobs yet.
+            </Typography>
+          ) : (
+            jobs.map((job) => (
+              <DataCard
+                key={job.id}
+                title={job.name}
+                headerAction={
+                  <Chip
+                    label={job.operation}
+                    size="small"
+                    variant="outlined"
+                    color={opColor(job.operation)}
+                  />
+                }
+                fields={[
+                  {
+                    label: "Schedule",
+                    value: (
+                      <Typography variant="body2" sx={{ fontFamily: "monospace" }}>
+                        {job.schedule_cron ?? "manual"}
+                      </Typography>
+                    ),
+                  },
+                  { label: "Enabled", value: enabledSwitch(job) },
+                ]}
+                actions={jobActions(job)}
+              />
+            ))
+          )}
+        </Box>
+      ) : (
+        <TableContainer component={Paper}>
+          <Table aria-label="Jobs">
+            <TableHead>
               <TableRow>
-                <TableCell colSpan={5} align="center" sx={{ py: 4, color: "text.secondary" }}>
-                  Loading…
-                </TableCell>
+                <TableCell>Name</TableCell>
+                <TableCell>Operation</TableCell>
+                <TableCell>Schedule</TableCell>
+                <TableCell>Enabled</TableCell>
+                <TableCell>Actions</TableCell>
               </TableRow>
-            ) : !jobs?.length ? (
-              <TableRow>
-                <TableCell colSpan={5} align="center" sx={{ py: 4, color: "text.secondary" }}>
-                  No jobs yet.
-                </TableCell>
-              </TableRow>
-            ) : (
-              jobs.map((job) => (
-                <TableRow key={job.id}>
-                  <TableCell>{job.name}</TableCell>
-                  <TableCell>
-                    <Chip
-                      label={job.operation}
-                      size="small"
-                      variant="outlined"
-                      color={opColor(job.operation)}
-                    />
-                  </TableCell>
-                  <TableCell>
-                    <Typography
-                      component="span"
-                      variant="body2"
-                      sx={{ fontFamily: "monospace" }}
-                    >
-                      {job.schedule_cron ?? "manual"}
-                    </Typography>
-                  </TableCell>
-                  <TableCell>
-                    <Switch
-                      checked={job.enabled}
-                      size="small"
-                      onChange={(e) =>
-                        toggleMut.mutate({ id: job.id, enabled: e.target.checked })
-                      }
-                    />
-                  </TableCell>
-                  <TableCell>
-                    <Box sx={{ display: "flex", gap: 1, flexWrap: "wrap" }}>
-                      <Button
-                        size="small"
-                        variant="outlined"
-                        onClick={() => openEdit(job)}
-                      >
-                        Edit
-                      </Button>
-                      <Button
-                        size="small"
-                        variant="outlined"
-                        disabled={
-                          triggerMut.isPending && triggerMut.variables === job.id
-                        }
-                        startIcon={
-                          triggerMut.isPending &&
-                          triggerMut.variables === job.id ? (
-                            <CircularProgress size={12} />
-                          ) : undefined
-                        }
-                        onClick={() => setRunTarget(job)}
-                      >
-                        {`Run ${opLabel(job.operation)}`}
-                      </Button>
-                      <Button
-                        size="small"
-                        variant="outlined"
-                        color="error"
-                        onClick={() => setDeleteTarget(job)}
-                      >
-                        Delete
-                      </Button>
-                    </Box>
+            </TableHead>
+            <TableBody>
+              {isLoading ? (
+                <TableRow>
+                  <TableCell colSpan={5} align="center" sx={{ py: 4, color: "text.secondary" }}>
+                    Loading…
                   </TableCell>
                 </TableRow>
-              ))
-            )}
-          </TableBody>
-        </Table>
-      </TableContainer>
+              ) : !jobs?.length ? (
+                <TableRow>
+                  <TableCell colSpan={5} align="center" sx={{ py: 4, color: "text.secondary" }}>
+                    No jobs yet.
+                  </TableCell>
+                </TableRow>
+              ) : (
+                jobs.map((job) => (
+                  <TableRow key={job.id}>
+                    <TableCell>{job.name}</TableCell>
+                    <TableCell>
+                      <Chip
+                        label={job.operation}
+                        size="small"
+                        variant="outlined"
+                        color={opColor(job.operation)}
+                      />
+                    </TableCell>
+                    <TableCell>
+                      <Typography
+                        component="span"
+                        variant="body2"
+                        sx={{ fontFamily: "monospace" }}
+                      >
+                        {job.schedule_cron ?? "manual"}
+                      </Typography>
+                    </TableCell>
+                    <TableCell>{enabledSwitch(job)}</TableCell>
+                    <TableCell>
+                      <Box sx={{ display: "flex", gap: 1, flexWrap: "wrap" }}>
+                        {jobActions(job)}
+                      </Box>
+                    </TableCell>
+                  </TableRow>
+                ))
+              )}
+            </TableBody>
+          </Table>
+        </TableContainer>
+      )}
 
       <Dialog
         open={isOpen}
         onClose={() => setIsOpen(false)}
         maxWidth="md"
         fullWidth
+        fullScreen={isMobile}
         scroll="paper"
       >
         <DialogTitle sx={{ pr: 6 }}>
@@ -492,6 +544,7 @@ export function Jobs() {
               )}
               <FileBrowser
                 nodeId={form.source_node_id}
+                sftpRoot={nodes?.find((n) => n.id === form.source_node_id)?.sftp_root}
                 selected={activePaths}
                 onChange={(paths) => {
                   const field = isDelete ? "target_paths" : "source_paths";
@@ -593,6 +646,7 @@ export function Jobs() {
                   </Typography>
                   <FileBrowser
                     nodeId={form.dest_node_id}
+                    sftpRoot={nodes?.find((n) => n.id === form.dest_node_id)?.sftp_root}
                     selected={form.dest_path ? [form.dest_path] : []}
                     onChange={(paths) =>
                       setForm((f) => ({ ...f, dest_path: paths[0] ?? "" }))
@@ -642,6 +696,17 @@ export function Jobs() {
                   />
                 }
                 label="Enabled"
+              />
+              <FormControlLabel
+                control={
+                  <Switch
+                    checked={form.delete_on_success ?? false}
+                    onChange={(e) =>
+                      setForm((f) => ({ ...f, delete_on_success: e.target.checked }))
+                    }
+                  />
+                }
+                label="Delete job on success"
               />
               {!editing && (
                 <FormControlLabel

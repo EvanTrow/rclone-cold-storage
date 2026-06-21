@@ -59,7 +59,7 @@ export const nodesApi = {
   getFiles: (id: number) =>
     request<CacheEntry[]>(`/api/nodes/${id}/files`),
   refreshFiles: (id: number) =>
-    request(`/api/nodes/${id}/files/refresh`, { method: "POST" }),
+    request<{ files: number; dirs: number }>(`/api/nodes/${id}/files/refresh`, { method: "POST" }),
   wake: (id: number) =>
     request(`/api/nodes/${id}/wake`, { method: "POST" }),
   shutdown: (id: number) =>
@@ -89,10 +89,12 @@ export const runsApi = {
     if (params?.unread_only) q.set("unread_only", "true");
     return request<Run[]>(`/api/runs?${q}`);
   },
-  get: (id: number) => request<Run>(`/api/runs/${id}`),
+  get: (id: number, logFrom = 0) =>
+    request<Run>(`/api/runs/${id}${logFrom > 0 ? `?log_from=${logFrom}` : ''}`),
   cancel: (id: number) => request(`/api/runs/${id}/cancel`, { method: "POST" }),
   markAllRead: () => request("/api/runs/mark-all-read", { method: "POST" }),
   markRead: (id: number) => request(`/api/runs/${id}/read`, { method: "PATCH" }),
+  clearAll: () => request<{ deleted: number }>("/api/runs", { method: "DELETE" }),
 };
 
 // Settings
@@ -188,6 +190,7 @@ export interface Job {
   schedule_cron: string | null;
   shutdown_after: boolean;
   enabled: boolean;
+  delete_on_success: boolean;
 }
 
 export interface JobCreate {
@@ -201,12 +204,14 @@ export interface JobCreate {
   schedule_cron?: string;
   shutdown_after?: boolean;
   enabled?: boolean;
+  delete_on_success?: boolean;
   run_now?: boolean;
 }
 
 export interface Run {
   id: number;
-  job_id: number;
+  job_id: number | null;
+  job_name: string | null;
   started_at: string | null;
   finished_at: string | null;
   status: "success" | "failed" | "running" | "queued" | "cancelled";
@@ -215,6 +220,7 @@ export interface Run {
   validation_passed: boolean | null;
   alert_read: boolean;
   log_output?: string;
+  log_length?: number;
 }
 
 export interface UserRecord {
